@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Local quality gate. Run by .githooks/pre-push; there is no hosted CI.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+if [ "$(git config --get core.hooksPath || true)" != ".githooks" ]; then
+  echo "warning: core.hooksPath is not .githooks, so pushes are not gated." >&2
+  echo "         run: git config --worktree core.hooksPath .githooks" >&2
+fi
+for f in bin/ci .githooks/pre-push; do
+  mode=$(git ls-files -s -- "$f" | cut -d' ' -f1)
+  if [ -n "$mode" ] && [ "$mode" != "100755" ]; then
+    echo "error: $f is not committed as executable (mode $mode)" >&2
+    exit 1
+  fi
+done
+
+cargo fmt --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
