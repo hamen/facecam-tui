@@ -401,6 +401,7 @@ pub fn run(shared: Shared, events: Sender<Event>, sysfs: PathBuf, dev: PathBuf) 
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum Served {
     Quit,
     Gone(String),
@@ -772,6 +773,108 @@ mod tests {
             apply(&mut cam, &batch).is_err(),
             "ENODEV means the camera is gone"
         );
+    }
+
+    /// Runs `serve` with the fake camera in a thread, as the worker does.
+    struct Harness {
+        shared: Shared,
+        events: std::sync::mpsc::Receiver<Event>,
+        handle: std::thread::JoinHandle<Served>,
+        _usb: tempfile::NamedTempFile,
+    }
+
+    fn serve_fake(cam: Fake) -> Harness {
+        let usb = tempfile::NamedTempFile::new().unwrap();
+        let found = usb::Found {
+            sysname: "6-3".into(),
+            usb_node: usb.path().to_path_buf(),
+            video_node: None,
+        };
+        let shared = Shared::default();
+        let (tx, events) = std::sync::mpsc::channel();
+        let thread_shared = shared.clone();
+        let handle = std::thread::spawn(move || {
+            let mut cam = cam;
+            let mut last_rev = 0;
+            serve(&thread_shared, &tx, &mut cam, &found, 1, &mut last_rev)
+        });
+        Harness {
+            shared,
+            events,
+            handle,
+            _usb: usb,
+        }
+    }
+
+    fn next_event(events: &std::sync::mpsc::Receiver<Event>) -> Event {
+        events
+            .recv_timeout(Duration::from_secs(2))
+            .expect("no event from serve")
+    }
+
+    fn values_rev(event: Event) -> u64 {
+        match event {
+            Event::Values { rev, .. } => rev,
+            other => panic!("expected Values, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_reads_on_start_and_after_an_idle_write() {
+        let s = serve_fake(Fake::default());
+        assert_eq!(values_rev(next_event(&s.events)), 0, "initial read");
+        s.shared.submit([Command::Brightness { rev: 4, value: 10 }]);
+        assert_eq!(values_rev(next_event(&s.events)), 4, "read-back once idle");
+        s.shared.submit([Command::Quit { rev: 5 }]);
+        assert_eq!(s.handle.join().unwrap(), Served::Quit);
+    }
+
+    #[test]
+    fn serve_reports_a_failure_then_reads_back() {
+        let s = serve_fake(Fake {
+            fail_brightness: true,
+            ..Fake::default()
+        });
+        next_event(&s.events);
+        s.shared.submit([Command::Brightness { rev: 2, value: 10 }]);
+        assert!(matches!(
+            next_event(&s.events),
+            Event::Failed {
+                rev: 2,
+                target: Target::Brightness,
+                ..
+            }
+        ));
+        assert_eq!(values_rev(next_event(&s.events)), 2);
+        s.shared.submit([Command::Quit { rev: 3 }]);
+        assert_eq!(s.handle.join().unwrap(), Served::Quit);
+    }
+
+    #[test]
+    fn serve_reads_on_request_and_quits_without_a_read() {
+        let s = serve_fake(Fake::default());
+        next_event(&s.events);
+        s.shared.submit([Command::ReadAll { rev: 7 }]);
+        assert_eq!(values_rev(next_event(&s.events)), 7);
+        s.shared.submit([
+            Command::Exposure {
+                rev: 8,
+                value: 150,
+                ensure_shutter: false,
+            },
+            Command::Quit { rev: 9 },
+        ]);
+        assert_eq!(s.handle.join().unwrap(), Served::Quit);
+        assert!(s.events.try_recv().is_err(), "quit sends no read-back");
+    }
+
+    #[test]
+    fn serve_notices_the_usb_node_disappearing() {
+        let s = serve_fake(Fake::default());
+        next_event(&s.events);
+        std::fs::remove_file(s._usb.path()).unwrap();
+        s.shared.request_check();
+        assert!(matches!(s.handle.join().unwrap(), Served::Gone(_)));
     }
 
     #[test]
