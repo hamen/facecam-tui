@@ -116,12 +116,23 @@ fn run(video: &PathBuf, slot: &Slot, status: &Sender<Status>, shared: &Shared, s
         if matches!(report, Status::Gone(_)) {
             shared.request_check();
         }
+        let retry = retries(&report);
         let _ = status.send(report);
+        if !retry {
+            return; // reported once; a new Capture starts on the next DeviceUp
+        }
         let end = Instant::now() + RETRY;
         while Instant::now() < end && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(POLL_MS as u64));
         }
     }
+}
+
+/// Busy (another app holds the stream) and Gone (the worker decides about the device) are
+/// retried every 2 s. Any other error is reported once and the thread ends: retrying a format
+/// the driver refuses would only repeat the same failure.
+fn retries(status: &Status) -> bool {
+    matches!(status, Status::Busy | Status::Gone(_))
 }
 
 fn classify(e: &io::Error) -> Status {
@@ -287,6 +298,14 @@ mod tests {
         assert!(check_format(&format(b"YUYV", 960, 540), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 1920, 1080), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 960, 540), Fraction::new(1, 60)).is_err());
+    }
+
+    #[test]
+    fn only_busy_and_gone_are_retried() {
+        assert!(retries(&Status::Busy));
+        assert!(retries(&Status::Gone("ENODEV".into())));
+        assert!(!retries(&Status::Error("EINVAL from S_FMT".into())));
+        assert!(!retries(&Status::NoAccess("EACCES".into())));
     }
 
     #[test]
