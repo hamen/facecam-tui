@@ -7,7 +7,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender,
+        mpsc::{self, Receiver, Sender},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -48,22 +48,44 @@ pub struct Frame {
 }
 
 /// The newest decoded frame; the lock is held only to swap it.
-pub type Slot = Arc<Mutex<Option<Frame>>>;
+type Slot = Arc<Mutex<Option<Frame>>>;
 
+/// One capture thread. Its frame slot and status channel belong to it alone: a thread that
+/// outlives [`Capture::stop`] (stuck in the kernel) writes into a slot and a channel nobody reads
+/// any more, never into those of the capture that replaced it.
 pub struct Capture {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    slot: Slot,
+    statuses: Receiver<Status>,
 }
 
 impl Capture {
-    pub fn start(video: PathBuf, slot: Slot, status: Sender<Status>, shared: Shared) -> Self {
+    pub fn start(video: PathBuf, shared: Shared) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = stop.clone();
+        let slot = Slot::default();
+        let (status, statuses) = mpsc::channel();
+        let (thread_stop, thread_slot) = (stop.clone(), slot.clone());
         let handle = std::thread::Builder::new()
             .name("capture".into())
-            .spawn(move || run(&video, &slot, &status, &shared, &thread_stop))
+            .spawn(move || run(&video, &thread_slot, &status, &shared, &thread_stop))
             .ok();
-        Self { stop, handle }
+        Self {
+            stop,
+            handle,
+            slot,
+            statuses,
+        }
+    }
+
+    /// Takes the newest decoded frame, if one arrived since the last call.
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+
+    /// The next status report, if any.
+    pub fn try_status(&self) -> Option<Status> {
+        self.statuses.try_recv().ok()
     }
 
     /// Asks the thread to stop and waits at most `timeout` for it; a thread stuck in the
@@ -213,6 +235,40 @@ const fn libc_pollin() -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn statuses_until_gone(capture: &Capture) -> Vec<Status> {
+        let end = Instant::now() + Duration::from_secs(2);
+        let mut seen = Vec::new();
+        while Instant::now() < end {
+            match capture.try_status() {
+                Some(s) => {
+                    let gone = matches!(s, Status::Gone(_));
+                    seen.push(s);
+                    if gone {
+                        break;
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn each_capture_has_its_own_status_channel_and_slot() {
+        let old = Capture::start(PathBuf::from("/nonexistent/old-video"), Shared::default());
+        let new = Capture::start(PathBuf::from("/nonexistent/new-video"), Shared::default());
+        // Each capture reports its own start and failure, exactly once, on its own channel.
+        for capture in [&old, &new] {
+            let seen = statuses_until_gone(capture);
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0], Status::Starting);
+            assert!(matches!(seen[1], Status::Gone(_)), "{seen:?}");
+        }
+        old.stop(Duration::from_millis(500));
+        assert!(new.take_frame().is_none());
+        new.stop(Duration::from_millis(500));
+    }
 
     fn format(fourcc: &[u8; 4], w: u32, h: u32) -> Format {
         Format::new(w, h, FourCC::new(fourcc))

@@ -25,7 +25,7 @@ use ratatui_image::{
 
 use crate::{
     app::App,
-    capture::{Capture, Slot},
+    capture::Capture,
     control::{Event, Shared},
 };
 
@@ -77,8 +77,6 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
     }
 
     let mut app = App::default();
-    let slot: Slot = Slot::default();
-    let (status_tx, statuses) = mpsc::channel();
     let mut capture: Option<(PathBuf, Capture)> = None;
     let mut protocol: Option<StatefulProtocol> = None;
     let mut last_seq = 0;
@@ -95,12 +93,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
                         }
                         capture = Some((
                             video_node.clone(),
-                            Capture::start(
-                                video_node.clone(),
-                                slot.clone(),
-                                status_tx.clone(),
-                                shared.clone(),
-                            ),
+                            Capture::start(video_node.clone(), shared.clone()),
                         ));
                     }
                 }
@@ -108,21 +101,20 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
                     if let Some((_, old)) = capture.take() {
                         old.stop(Duration::from_millis(500));
                     }
-                    clear_preview(&mut protocol, &slot, kitty)?;
+                    clear_preview(&mut protocol, kitty)?;
                 }
                 _ => {}
             }
             app.on_event(event);
         }
-        while let Ok(status) = statuses.try_recv() {
+        while let Some(status) = capture.as_ref().and_then(|(_, c)| c.try_status()) {
             let streaming = status == capture::Status::Streaming;
             app.on_capture(status);
             if !streaming {
-                clear_preview(&mut protocol, &slot, kitty)?;
+                clear_preview(&mut protocol, kitty)?;
             }
         }
-        let frame = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(frame) = frame
+        if let Some(frame) = capture.as_ref().and_then(|(_, c)| c.take_frame())
             && frame.seq != last_seq
         {
             last_seq = frame.seq;
@@ -203,9 +195,8 @@ fn new_protocol(picker: &Picker, image: DynamicImage) -> StatefulProtocol {
     )
 }
 
-fn clear_preview(protocol: &mut Option<StatefulProtocol>, slot: &Slot, kitty: bool) -> Result<()> {
+fn clear_preview(protocol: &mut Option<StatefulProtocol>, kitty: bool) -> Result<()> {
     *protocol = None;
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
     if kitty {
         delete_kitty_images()?;
     }
