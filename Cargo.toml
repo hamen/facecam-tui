@@ -7,3 +7,18 @@ license = "MIT"
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+nix = { version = "0.30", features = ["ioctl", "poll", "fs"] }
+ratatui = "0.30"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm"] }
+v4l = "0.14"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# JPEG decode and image scaling are far too slow unoptimized for a live preview; keep dependencies
+# optimized in dev builds too.
+[profile.dev.package."*"]
+opt-level = 3
