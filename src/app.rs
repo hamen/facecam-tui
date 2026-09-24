@@ -1,0 +1,793 @@
+//! Pure UI state: focus, values, number entry, pending writes, throttle. No I/O.
+
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::{
+    camera::Mode,
+    capture,
+    control::{Command, Event, Target},
+};
+
+/// At most one exposure write per window; the last value is always sent.
+pub const THROTTLE: Duration = Duration::from_millis(30);
+/// The bar spans 1..=BAR_MAX: the 30 fps ceiling (1/30 s = 333 × 100 µs).
+pub const BAR_MAX: u32 = 333;
+/// Above this, apps capturing at 60 fps drop frames (1/60 s = 166 × 100 µs).
+pub const FPS60_MAX: u32 = 166;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Exposure,
+    Brightness,
+    Mode,
+}
+
+impl Focus {
+    fn next(self) -> Self {
+        match self {
+            Focus::Exposure => Focus::Brightness,
+            Focus::Brightness => Focus::Mode,
+            Focus::Mode => Focus::Exposure,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Focus::Exposure => Focus::Mode,
+            Focus::Brightness => Focus::Exposure,
+            Focus::Mode => Focus::Brightness,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preview {
+    NoCamera,
+    Starting,
+    Streaming,
+    Busy,
+    Problem(String),
+}
+
+#[derive(Debug)]
+pub struct App {
+    pub focus: Focus,
+    pub exposure: Option<u32>,
+    pub exposure_range: Result<(u32, u32), String>,
+    pub brightness: Option<i64>,
+    pub brightness_range: Option<(i64, i64)>,
+    pub mode: Option<Mode>,
+    /// Digits typed in number entry, when open.
+    pub entry: Option<String>,
+    pub message: Option<String>,
+    pub device: Option<String>,
+    pub preview: Preview,
+    pub quit: bool,
+    generation: u64,
+    rev: u64,
+    /// Newest write sent to the worker, per control (index = Target as usize).
+    last_write: [u64; 3],
+    /// Exposure changes held back by the throttle.
+    held: Option<(u64, u32, bool)>,
+    last_exposure_send: Option<Instant>,
+}
+
+fn idx(target: Target) -> usize {
+    match target {
+        Target::Exposure => 0,
+        Target::Brightness => 1,
+        Target::Mode => 2,
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            focus: Focus::Exposure,
+            exposure: None,
+            exposure_range: Err("camera not connected".into()),
+            brightness: None,
+            brightness_range: None,
+            mode: None,
+            entry: None,
+            message: None,
+            device: None,
+            preview: Preview::NoCamera,
+            quit: false,
+            generation: 0,
+            rev: 0,
+            last_write: [0; 3],
+            held: None,
+            last_exposure_send: None,
+        }
+    }
+}
+
+impl App {
+    fn next_rev(&mut self) -> u64 {
+        self.rev += 1;
+        self.rev
+    }
+
+    /// How long the event loop may sleep before [`App::tick`] has something to send.
+    pub fn poll_timeout(&self, now: Instant) -> Option<Duration> {
+        self.held?;
+        let sent = self.last_exposure_send?;
+        Some(THROTTLE.saturating_sub(now.saturating_duration_since(sent)))
+    }
+
+    /// Sends a held exposure write once its window has passed.
+    pub fn tick(&mut self, now: Instant) -> Vec<Command> {
+        match (self.held, self.last_exposure_send) {
+            (Some(_), Some(sent)) if now.saturating_duration_since(sent) >= THROTTLE => {
+                self.flush_exposure(now)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn flush_exposure(&mut self, now: Instant) -> Vec<Command> {
+        let Some((rev, value, ensure_shutter)) = self.held.take() else {
+            return Vec::new();
+        };
+        self.last_exposure_send = Some(now);
+        vec![Command::Exposure {
+            rev,
+            value,
+            ensure_shutter,
+        }]
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, now: Instant) -> Vec<Command> {
+        if key.kind == KeyEventKind::Release {
+            return Vec::new();
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return self.request_quit(now);
+        }
+        if self.entry.is_some() {
+            return self.entry_key(key, now);
+        }
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.request_quit(now),
+            KeyCode::Tab => {
+                self.focus = self.focus.next();
+                Vec::new()
+            }
+            KeyCode::BackTab => {
+                self.focus = self.focus.prev();
+                Vec::new()
+            }
+            KeyCode::Left => self.step(if shift { -10 } else { -1 }, now),
+            KeyCode::Right => self.step(if shift { 10 } else { 1 }, now),
+            KeyCode::PageDown => self.step(-100, now),
+            KeyCode::PageUp => self.step(100, now),
+            KeyCode::Char('[') if self.focus != Focus::Mode => self.snap(false, now),
+            KeyCode::Char(']') if self.focus != Focus::Mode => self.snap(true, now),
+            KeyCode::Char('a') => self.toggle_mode(),
+            KeyCode::Char('r') => self.read_all(),
+            KeyCode::Enter | KeyCode::Char(':') if self.focus != Focus::Mode => {
+                self.entry = Some(String::new());
+                self.message = None;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn entry_key(&mut self, key: KeyEvent, now: Instant) -> Vec<Command> {
+        let entry = self.entry.get_or_insert_with(String::new);
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                if entry.len() < 10 {
+                    entry.push(c);
+                }
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                entry.pop();
+                Vec::new()
+            }
+            KeyCode::Esc => {
+                self.entry = None;
+                Vec::new()
+            }
+            KeyCode::Enter => {
+                let text = self.entry.take().unwrap_or_default();
+                self.apply_typed(&text, now)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn apply_typed(&mut self, text: &str, now: Instant) -> Vec<Command> {
+        let parsed: Option<i64> = text.parse().ok();
+        match self.focus {
+            Focus::Exposure => {
+                let Ok((min, max)) = self.exposure_range.clone() else {
+                    return self.refuse_exposure();
+                };
+                match parsed
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|v| (min..=max).contains(v))
+                {
+                    Some(v) => self.set_exposure(v, now),
+                    None => self.error(format!("exposure must be {min}..{max}")),
+                }
+            }
+            Focus::Brightness => {
+                let Some((min, max)) = self.brightness_range else {
+                    return self.error("brightness range unknown".into());
+                };
+                match parsed.filter(|v| (min..=max).contains(v)) {
+                    Some(v) => self.set_brightness(v),
+                    None => self.error(format!("brightness must be {min}..{max}")),
+                }
+            }
+            Focus::Mode => Vec::new(),
+        }
+    }
+
+    fn error(&mut self, message: String) -> Vec<Command> {
+        self.message = Some(message);
+        Vec::new()
+    }
+
+    fn refuse_exposure(&mut self) -> Vec<Command> {
+        let reason = self.exposure_range.clone().err().unwrap_or_default();
+        self.error(format!("exposure unavailable: {reason}"))
+    }
+
+    fn step(&mut self, delta: i64, now: Instant) -> Vec<Command> {
+        match self.focus {
+            Focus::Exposure => {
+                let Ok((min, max)) = self.exposure_range.clone() else {
+                    return self.refuse_exposure();
+                };
+                let Some(current) = self.exposure else {
+                    return Vec::new();
+                };
+                let v = (i64::from(current) + delta).clamp(i64::from(min), i64::from(max));
+                self.set_exposure(v as u32, now)
+            }
+            Focus::Brightness => {
+                let (Some((min, max)), Some(current)) = (self.brightness_range, self.brightness)
+                else {
+                    return Vec::new();
+                };
+                self.set_brightness((current + delta).clamp(min, max))
+            }
+            // Only a single step toggles the mode; the larger steps do nothing here.
+            Focus::Mode if delta.abs() == 1 => self.toggle_mode(),
+            Focus::Mode => Vec::new(),
+        }
+    }
+
+    fn snap(&mut self, up: bool, now: Instant) -> Vec<Command> {
+        let Ok((_, max)) = self.exposure_range.clone() else {
+            return self.refuse_exposure();
+        };
+        let Some(current) = self.exposure else {
+            return Vec::new();
+        };
+        self.set_exposure(snap(current, max, up), now)
+    }
+
+    fn set_exposure(&mut self, value: u32, now: Instant) -> Vec<Command> {
+        let ensure = self.mode != Some(Mode::Shutter);
+        let rev = self.next_rev();
+        self.exposure = Some(value);
+        self.mode = Some(Mode::Shutter);
+        self.last_write[idx(Target::Exposure)] = rev;
+        let ensure = ensure || self.held.is_some_and(|(_, _, e)| e);
+        self.held = Some((rev, value, ensure));
+        match self.last_exposure_send {
+            Some(sent) if now.saturating_duration_since(sent) < THROTTLE => Vec::new(),
+            _ => self.flush_exposure(now),
+        }
+    }
+
+    fn set_brightness(&mut self, value: i64) -> Vec<Command> {
+        let rev = self.next_rev();
+        self.brightness = Some(value);
+        self.last_write[idx(Target::Brightness)] = rev;
+        vec![Command::Brightness { rev, value }]
+    }
+
+    fn toggle_mode(&mut self) -> Vec<Command> {
+        let Some(mode) = self.mode else {
+            return Vec::new();
+        };
+        let mode = mode.toggled();
+        let rev = self.next_rev();
+        self.mode = Some(mode);
+        self.last_write[idx(Target::Mode)] = rev;
+        if mode == Mode::Auto {
+            self.held = None;
+        }
+        vec![Command::Mode { rev, mode }]
+    }
+
+    fn read_all(&mut self) -> Vec<Command> {
+        self.held = None;
+        let rev = self.next_rev();
+        self.message = None;
+        vec![Command::ReadAll { rev }]
+    }
+
+    fn request_quit(&mut self, now: Instant) -> Vec<Command> {
+        self.entry = None;
+        self.quit = true;
+        let mut commands = self.flush_exposure(now);
+        let rev = self.next_rev();
+        commands.push(Command::Quit { rev });
+        commands
+    }
+
+    pub fn on_event(&mut self, event: Event) {
+        match event {
+            Event::Up {
+                generation,
+                video_node,
+                ranges,
+            } => {
+                self.generation = generation;
+                self.device = Some(video_node.display().to_string());
+                self.exposure_range = ranges.exposure;
+                self.brightness_range = ranges.brightness.ok();
+                self.message = None;
+            }
+            Event::Gone { generation, reason } => {
+                if generation < self.generation {
+                    return;
+                }
+                self.device = None;
+                self.held = None;
+                self.exposure = None;
+                self.brightness = None;
+                self.mode = None;
+                self.exposure_range = Err(reason.clone());
+                self.preview = Preview::NoCamera;
+                self.message = Some(reason);
+            }
+            Event::Values {
+                generation,
+                rev,
+                values,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                if rev >= self.last_write[idx(Target::Exposure)] && self.held.is_none() {
+                    match values.exposure {
+                        Ok(v) => self.exposure = Some(v),
+                        Err(e) => {
+                            self.exposure = None;
+                            self.message = Some(e);
+                        }
+                    }
+                }
+                if rev >= self.last_write[idx(Target::Brightness)] {
+                    self.brightness = values.brightness.ok();
+                }
+                if rev >= self.last_write[idx(Target::Mode)] {
+                    self.mode = values.mode.ok();
+                }
+            }
+            Event::Failed {
+                generation,
+                rev,
+                target,
+                error,
+            } => {
+                if generation != self.generation {
+                    return;
+                }
+                if target == Target::Exposure && self.held.is_some_and(|(r, _, _)| r <= rev) {
+                    self.held = None;
+                }
+                self.message = Some(error);
+            }
+            Event::QuitDone => {}
+        }
+    }
+
+    pub fn on_capture(&mut self, status: capture::Status) {
+        self.preview = match status {
+            capture::Status::Starting => Preview::Starting,
+            capture::Status::Streaming => Preview::Streaming,
+            capture::Status::Busy => Preview::Busy,
+            capture::Status::NoAccess(e) => Preview::Problem(format!("no access: {e}")),
+            capture::Status::Gone(e) | capture::Status::Error(e) => Preview::Problem(e),
+        };
+    }
+}
+
+/// `[` / `]`: previous / next multiple of 100 within 100..=max (flicker-free under 50 Hz).
+/// Below 100, `[` goes UP to 100, the lowest flicker-free value.
+pub fn snap(value: u32, max: u32, up: bool) -> u32 {
+    let top = (max / 100 * 100).max(100);
+    let v = if up {
+        (value / 100 + 1) * 100
+    } else if value <= 100 {
+        100
+    } else {
+        (value - 1) / 100 * 100
+    };
+    v.clamp(100, top)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::control::{Ranges, Values};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    /// A connected camera in Shutter Priority at exposure 200, brightness 40.
+    fn app() -> App {
+        let mut app = App::default();
+        app.on_event(Event::Up {
+            generation: 1,
+            video_node: PathBuf::from("/dev/video0"),
+            ranges: Ranges {
+                exposure: Ok((1, 2500)),
+                brightness: Ok((0, 255)),
+            },
+        });
+        app.on_event(Event::Values {
+            generation: 1,
+            rev: 0,
+            values: Values {
+                exposure: Ok(200),
+                mode: Ok(Mode::Shutter),
+                brightness: Ok(40),
+            },
+        });
+        app
+    }
+
+    fn exposure_writes(commands: &[Command]) -> Vec<u32> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                Command::Exposure { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn snapping() {
+        assert_eq!((snap(150, 2500, false), snap(150, 2500, true)), (100, 200));
+        assert_eq!((snap(200, 2500, false), snap(200, 2500, true)), (100, 300));
+        assert_eq!((snap(50, 2500, false), snap(50, 2500, true)), (100, 100));
+        assert_eq!(
+            (snap(2500, 2500, false), snap(2500, 2500, true)),
+            (2400, 2500)
+        );
+        assert_eq!(snap(1, 2500, false), 100);
+        assert_eq!(snap(640, 650, true), 600, "top comes from the device max");
+    }
+
+    #[test]
+    fn tab_and_backtab_cycle_focus() {
+        let mut a = app();
+        let now = Instant::now();
+        a.handle_key(key(KeyCode::Tab), now);
+        assert_eq!(a.focus, Focus::Brightness);
+        a.handle_key(key(KeyCode::Tab), now);
+        assert_eq!(a.focus, Focus::Mode);
+        a.handle_key(key(KeyCode::Tab), now);
+        assert_eq!(a.focus, Focus::Exposure);
+        a.handle_key(key(KeyCode::BackTab), now);
+        assert_eq!(a.focus, Focus::Mode);
+    }
+
+    #[test]
+    fn step_sizes() {
+        let t0 = Instant::now();
+        let cases = [
+            (key(KeyCode::Right), 201),
+            (key(KeyCode::Left), 199),
+            (shift(KeyCode::Right), 210),
+            (shift(KeyCode::Left), 190),
+            (key(KeyCode::PageUp), 300),
+            (key(KeyCode::PageDown), 100),
+        ];
+        for (k, want) in cases {
+            let mut a = app();
+            assert_eq!(exposure_writes(&a.handle_key(k, t0)), [want], "{k:?}");
+        }
+        let mut a = app();
+        a.focus = Focus::Brightness;
+        let c = a.handle_key(shift(KeyCode::Right), t0);
+        assert!(matches!(c[..], [Command::Brightness { value: 50, .. }]));
+    }
+
+    #[test]
+    fn steps_clamp_to_the_device_range() {
+        let mut a = app();
+        let t = Instant::now();
+        a.exposure = Some(2);
+        assert_eq!(exposure_writes(&a.handle_key(shift(KeyCode::Left), t)), [1]);
+    }
+
+    #[test]
+    fn exposure_in_auto_asks_for_shutter_first() {
+        let mut a = app();
+        a.mode = Some(Mode::Auto);
+        let c = a.handle_key(key(KeyCode::Right), Instant::now());
+        assert!(matches!(
+            c[..],
+            [Command::Exposure {
+                value: 201,
+                ensure_shutter: true,
+                ..
+            }]
+        ));
+        assert_eq!(a.mode, Some(Mode::Shutter));
+    }
+
+    #[test]
+    fn throttle_sends_one_now_and_the_last_value_later() {
+        let mut a = app();
+        let t0 = Instant::now();
+        assert_eq!(
+            exposure_writes(&a.handle_key(key(KeyCode::Right), t0)),
+            [201]
+        );
+        let t1 = t0 + Duration::from_millis(10);
+        assert!(a.handle_key(key(KeyCode::Right), t1).is_empty());
+        assert!(a.handle_key(key(KeyCode::Right), t1).is_empty());
+        assert!(a.tick(t0 + Duration::from_millis(20)).is_empty());
+        assert_eq!(
+            a.poll_timeout(t0 + Duration::from_millis(20)),
+            Some(Duration::from_millis(10))
+        );
+        assert_eq!(exposure_writes(&a.tick(t0 + THROTTLE)), [203]);
+        assert!(a.tick(t0 + THROTTLE * 3).is_empty(), "nothing left to send");
+    }
+
+    #[test]
+    fn past_deadline_writes_now_and_timeout_saturates() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        let late = t0 + Duration::from_millis(500);
+        assert_eq!(a.poll_timeout(late), Some(Duration::ZERO));
+        assert_eq!(exposure_writes(&a.tick(late)), [202]);
+    }
+
+    #[test]
+    fn quit_flushes_a_held_write() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        let c = a.handle_key(key(KeyCode::Char('q')), t0 + Duration::from_millis(6));
+        assert_eq!(exposure_writes(&c), [202]);
+        assert!(matches!(c.last(), Some(Command::Quit { .. })));
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn switching_to_auto_cancels_a_held_write() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        let c = a.handle_key(key(KeyCode::Char('a')), t0 + Duration::from_millis(6));
+        assert!(matches!(
+            c[..],
+            [Command::Mode {
+                mode: Mode::Auto,
+                ..
+            }]
+        ));
+        assert!(a.tick(t0 + THROTTLE * 2).is_empty());
+    }
+
+    #[test]
+    fn r_cancels_held_writes_and_reads() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        let c = a.handle_key(key(KeyCode::Char('r')), t0 + Duration::from_millis(6));
+        assert!(matches!(c[..], [Command::ReadAll { .. }]));
+        assert!(a.tick(t0 + THROTTLE * 2).is_empty());
+    }
+
+    #[test]
+    fn number_entry() {
+        let mut a = app();
+        let t = Instant::now();
+        a.handle_key(key(KeyCode::Enter), t);
+        for k in [
+            KeyCode::Char('3'),
+            KeyCode::Char('9'),
+            KeyCode::Backspace,
+            KeyCode::Char('0'),
+        ] {
+            a.handle_key(key(k), t);
+        }
+        for ignored in ['q', 'a', 'r', 'x'] {
+            assert!(a.handle_key(key(KeyCode::Char(ignored)), t).is_empty());
+        }
+        assert!(!a.quit, "q is ignored in entry");
+        assert_eq!(a.entry.as_deref(), Some("30"));
+        assert_eq!(exposure_writes(&a.handle_key(key(KeyCode::Enter), t)), [30]);
+        assert_eq!(a.entry, None);
+    }
+
+    #[test]
+    fn esc_cancels_entry_without_quitting_and_quits_outside_it() {
+        let mut a = app();
+        let t = Instant::now();
+        a.handle_key(key(KeyCode::Char(':')), t);
+        assert!(a.handle_key(key(KeyCode::Esc), t).is_empty());
+        assert!(!a.quit);
+        assert_eq!(a.entry, None);
+        a.handle_key(key(KeyCode::Esc), t);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_in_and_out_of_entry() {
+        let mut a = app();
+        a.handle_key(key(KeyCode::Enter), Instant::now());
+        a.handle_key(ctrl_c(), Instant::now());
+        assert!(a.quit);
+        let mut b = app();
+        b.handle_key(ctrl_c(), Instant::now());
+        assert!(b.quit);
+    }
+
+    #[test]
+    fn out_of_range_and_oversized_input_is_rejected() {
+        let t = Instant::now();
+        for typed in ["0", "2501", "99999999999"] {
+            let mut a = app();
+            a.handle_key(key(KeyCode::Enter), t);
+            for ch in typed.chars() {
+                a.handle_key(key(KeyCode::Char(ch)), t);
+            }
+            assert!(a.handle_key(key(KeyCode::Enter), t).is_empty(), "{typed}");
+            assert!(a.message.as_deref().unwrap().contains("1..2500"), "{typed}");
+        }
+    }
+
+    #[test]
+    fn mode_focus_keys() {
+        let t = Instant::now();
+        let mut a = app();
+        a.focus = Focus::Mode;
+        assert!(a.handle_key(key(KeyCode::Enter), t).is_empty());
+        assert_eq!(a.entry, None, "no number entry on Mode");
+        for k in [
+            key(KeyCode::PageUp),
+            key(KeyCode::PageDown),
+            shift(KeyCode::Left),
+            shift(KeyCode::Right),
+        ] {
+            assert!(a.handle_key(k, t).is_empty(), "{k:?}");
+        }
+        assert!(a.handle_key(key(KeyCode::Char('[')), t).is_empty());
+        assert!(a.handle_key(key(KeyCode::Char(']')), t).is_empty());
+        let c = a.handle_key(key(KeyCode::Right), t);
+        assert!(matches!(
+            c[..],
+            [Command::Mode {
+                mode: Mode::Auto,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn read_back_does_not_overwrite_a_newer_write() {
+        let mut a = app();
+        let t = Instant::now();
+        let c = a.handle_key(key(KeyCode::PageUp), t);
+        let Command::Exposure { rev, .. } = c[0] else {
+            panic!()
+        };
+        let stale = Values {
+            exposure: Ok(200),
+            mode: Ok(Mode::Shutter),
+            brightness: Ok(40),
+        };
+        a.on_event(Event::Values {
+            generation: 1,
+            rev: rev - 1,
+            values: stale.clone(),
+        });
+        assert_eq!(a.exposure, Some(300), "older read ignored");
+        let fresh = Values {
+            exposure: Ok(299),
+            ..stale
+        };
+        a.on_event(Event::Values {
+            generation: 1,
+            rev,
+            values: fresh,
+        });
+        assert_eq!(
+            a.exposure,
+            Some(299),
+            "the camera's value wins once it answers our write"
+        );
+    }
+
+    #[test]
+    fn results_from_an_old_generation_are_dropped() {
+        let mut a = app();
+        let v = Values {
+            exposure: Ok(5),
+            mode: Ok(Mode::Auto),
+            brightness: Ok(1),
+        };
+        a.on_event(Event::Values {
+            generation: 0,
+            rev: 99,
+            values: v,
+        });
+        assert_eq!(a.exposure, Some(200));
+    }
+
+    #[test]
+    fn unknown_range_refuses_exposure() {
+        let mut a = app();
+        a.exposure_range = Err("GET_MAX failed".into());
+        assert!(a.handle_key(key(KeyCode::Right), Instant::now()).is_empty());
+        assert!(a.message.as_deref().unwrap().contains("GET_MAX failed"));
+    }
+
+    #[test]
+    fn gone_clears_values_and_held_writes() {
+        let mut a = app();
+        let t = Instant::now();
+        a.handle_key(key(KeyCode::Right), t);
+        a.handle_key(key(KeyCode::Right), t + Duration::from_millis(1));
+        a.on_event(Event::Gone {
+            generation: 1,
+            reason: "camera disconnected".into(),
+        });
+        assert_eq!(a.exposure, None);
+        assert!(a.tick(t + THROTTLE * 2).is_empty());
+        assert_eq!(a.preview, Preview::NoCamera);
+    }
+
+    #[test]
+    fn failed_shutter_switch_drops_the_held_value() {
+        let mut a = app();
+        let t = Instant::now();
+        a.handle_key(key(KeyCode::Right), t);
+        a.handle_key(key(KeyCode::Right), t + Duration::from_millis(1));
+        a.on_event(Event::Failed {
+            generation: 1,
+            rev: 99,
+            target: Target::Exposure,
+            error: "could not switch to Shutter Priority: EIO".into(),
+        });
+        assert!(a.tick(t + THROTTLE * 2).is_empty());
+        assert!(a.message.as_deref().unwrap().contains("Shutter"));
+    }
+}
