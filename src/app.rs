@@ -290,11 +290,19 @@ impl App {
         }
     }
 
+    /// Revisions must leave in order: a held exposure (older revision) goes out before any newer
+    /// write, instead of after it from `tick`. The worker only orders within one batch.
+    fn release_held(&mut self) -> Vec<Command> {
+        self.flush_exposure(Instant::now())
+    }
+
     fn set_brightness(&mut self, value: i64) -> Vec<Command> {
+        let mut commands = self.release_held();
         let rev = self.next_rev();
         self.brightness = Some(value);
         self.last_write[idx(Target::Brightness)] = rev;
-        vec![Command::Brightness { rev, value }]
+        commands.push(Command::Brightness { rev, value });
+        commands
     }
 
     fn toggle_mode(&mut self) -> Vec<Command> {
@@ -302,13 +310,19 @@ impl App {
             return Vec::new();
         };
         let mode = mode.toggled();
+        // Auto cancels a held exposure; Shutter Priority sends it first.
+        let mut commands = match mode {
+            Mode::Auto => {
+                self.held = None;
+                Vec::new()
+            }
+            Mode::Shutter => self.release_held(),
+        };
         let rev = self.next_rev();
         self.mode = Some(mode);
         self.last_write[idx(Target::Mode)] = rev;
-        if mode == Mode::Auto {
-            self.held = None;
-        }
-        vec![Command::Mode { rev, mode }]
+        commands.push(Command::Mode { rev, mode });
+        commands
     }
 
     fn read_all(&mut self) -> Vec<Command> {
@@ -793,6 +807,52 @@ mod tests {
         assert_eq!(a.exposure, None);
         assert!(a.tick(t + THROTTLE * 2).is_empty());
         assert_eq!(a.preview, Preview::NoCamera);
+    }
+
+    #[test]
+    fn a_newer_write_sends_the_held_exposure_first() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5)); // held
+        a.handle_key(key(KeyCode::Tab), t0 + Duration::from_millis(6));
+        let c = a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(7));
+        let revs: Vec<u64> = c
+            .iter()
+            .map(|c| match c {
+                Command::Exposure { rev, .. } | Command::Brightness { rev, .. } => *rev,
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert!(matches!(
+            c[..],
+            [
+                Command::Exposure { value: 202, .. },
+                Command::Brightness { .. }
+            ]
+        ));
+        assert!(revs[0] < revs[1], "revisions leave in order: {revs:?}");
+        assert!(a.tick(t0 + THROTTLE * 2).is_empty(), "nothing still held");
+    }
+
+    #[test]
+    fn switching_to_shutter_sends_the_held_exposure_first() {
+        let mut a = app();
+        let t0 = Instant::now();
+        a.handle_key(key(KeyCode::Right), t0);
+        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5)); // held
+        a.mode = Some(Mode::Auto); // a read-back flipped the shown mode
+        let c = a.handle_key(key(KeyCode::Char('a')), t0 + Duration::from_millis(6));
+        assert!(matches!(
+            c[..],
+            [
+                Command::Exposure { value: 202, .. },
+                Command::Mode {
+                    mode: Mode::Shutter,
+                    ..
+                }
+            ]
+        ));
     }
 
     #[test]

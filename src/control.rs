@@ -33,7 +33,7 @@ pub enum Command {
         rev: u64,
         mode: Mode,
     },
-    /// Cancels every older pending write, then reads all values.
+    /// A barrier: everything older is applied, then all values are read.
     ReadAll {
         rev: u64,
     },
@@ -83,12 +83,9 @@ impl Desired {
                 }
                 self.mode = Some((rev, mode));
             }
-            Command::ReadAll { rev } => {
-                self.exposure = None;
-                self.brightness = None;
-                self.mode = None;
-                self.read_all = Some(rev);
-            }
+            // A barrier, not a cancel: older writes are applied first, then everything is read.
+            // (The UI drops its own held exposure before it sends this.)
+            Command::ReadAll { rev } => self.read_all = Some(rev),
             Command::Quit { rev } => self.quit = Some(rev),
         }
     }
@@ -692,27 +689,22 @@ mod tests {
     }
 
     #[test]
-    fn read_all_cancels_pending_writes() {
-        let d = desired(&[
+    fn read_all_is_a_barrier_that_applies_older_writes_first() {
+        let batch = desired(&[
             Command::Exposure {
                 rev: 1,
                 value: 300,
                 ensure_shutter: false,
             },
             Command::Brightness { rev: 2, value: 10 },
-            Command::Mode {
-                rev: 3,
-                mode: Mode::Shutter,
-            },
-            Command::ReadAll { rev: 4 },
+            Command::ReadAll { rev: 3 },
         ]);
-        assert_eq!(
-            d,
-            Desired {
-                read_all: Some(4),
-                ..Desired::default()
-            }
-        );
+        assert_eq!(batch.read_all, Some(3));
+        let mut cam = Fake::default();
+        let applied = apply(&mut cam, &batch).unwrap();
+        assert_eq!(cam.calls, [Call::Exposure(300), Call::Brightness(10)]);
+        assert!(applied.read_requested);
+        assert_eq!(applied.max_rev, 3);
     }
 
     #[test]
