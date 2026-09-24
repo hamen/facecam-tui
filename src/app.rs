@@ -336,9 +336,13 @@ impl App {
             } => {
                 self.generation = generation;
                 self.device = Some(video_node.display().to_string());
+                self.message = match (&ranges.exposure, &ranges.brightness) {
+                    (Err(e), _) => Some(format!("exposure unavailable: {e}")),
+                    (_, Err(e)) => Some(format!("brightness unavailable: {e}")),
+                    _ => None,
+                };
                 self.exposure_range = ranges.exposure;
                 self.brightness_range = ranges.brightness.ok();
-                self.message = None;
             }
             Event::Gone { generation, reason } => {
                 if generation < self.generation {
@@ -346,6 +350,10 @@ impl App {
                 }
                 self.device = None;
                 self.held = None;
+                // Writes that never reached the device are gone with it; without this reset a
+                // read-back after the reconnect would look older than them and be ignored.
+                self.last_write = [0; 3];
+                self.brightness_range = None;
                 self.exposure = None;
                 self.brightness = None;
                 self.mode = None;
@@ -371,10 +379,22 @@ impl App {
                     }
                 }
                 if rev >= self.last_write[idx(Target::Brightness)] {
-                    self.brightness = values.brightness.ok();
+                    match values.brightness {
+                        Ok(v) => self.brightness = Some(v),
+                        Err(e) => {
+                            self.brightness = None;
+                            self.message = Some(e);
+                        }
+                    }
                 }
                 if rev >= self.last_write[idx(Target::Mode)] {
-                    self.mode = values.mode.ok();
+                    match values.mode {
+                        Ok(m) => self.mode = Some(m),
+                        Err(e) => {
+                            self.mode = None;
+                            self.message = Some(e);
+                        }
+                    }
                 }
             }
             Event::Failed {
@@ -773,6 +793,82 @@ mod tests {
         assert_eq!(a.exposure, None);
         assert!(a.tick(t + THROTTLE * 2).is_empty());
         assert_eq!(a.preview, Preview::NoCamera);
+    }
+
+    #[test]
+    fn values_after_a_reconnect_are_accepted_even_if_a_write_was_lost() {
+        let mut a = app();
+        let t = Instant::now();
+        // A write the worker never applies: the device goes away first.
+        a.handle_key(key(KeyCode::PageUp), t);
+        a.on_event(Event::Gone {
+            generation: 1,
+            reason: "camera disconnected".into(),
+        });
+        a.on_event(Event::Up {
+            generation: 2,
+            video_node: PathBuf::from("/dev/video0"),
+            ranges: Ranges {
+                exposure: Ok((1, 2500)),
+                brightness: Ok((0, 255)),
+            },
+        });
+        // The worker's revision never reached the lost write.
+        a.on_event(Event::Values {
+            generation: 2,
+            rev: 0,
+            values: Values {
+                exposure: Ok(200),
+                mode: Ok(Mode::Shutter),
+                brightness: Ok(40),
+            },
+        });
+        assert_eq!(a.exposure, Some(200));
+        assert_eq!(a.brightness, Some(40));
+        assert_eq!(a.mode, Some(Mode::Shutter));
+    }
+
+    #[test]
+    fn range_and_read_errors_are_shown() {
+        let mut a = App::default();
+        a.on_event(Event::Up {
+            generation: 1,
+            video_node: PathBuf::from("/dev/video0"),
+            ranges: Ranges {
+                exposure: Err("no write access to /dev/bus/usb/006/007".into()),
+                brightness: Ok((0, 255)),
+            },
+        });
+        assert!(a.message.as_deref().unwrap().contains("no write access"));
+
+        let mut b = app();
+        b.on_event(Event::Values {
+            generation: 1,
+            rev: 0,
+            values: Values {
+                exposure: Ok(200),
+                mode: Err("mode read failed".into()),
+                brightness: Ok(40),
+            },
+        });
+        assert!(b.message.as_deref().unwrap().contains("mode read failed"));
+
+        let mut c = app();
+        c.on_event(Event::Values {
+            generation: 1,
+            rev: 0,
+            values: Values {
+                exposure: Ok(200),
+                mode: Ok(Mode::Shutter),
+                brightness: Err("brightness read failed".into()),
+            },
+        });
+        assert!(
+            c.message
+                .as_deref()
+                .unwrap()
+                .contains("brightness read failed")
+        );
     }
 
     #[test]
