@@ -283,13 +283,19 @@ impl App {
     }
 
     fn snap(&mut self, up: bool, now: Instant) -> Vec<Command> {
-        let Ok((_, max)) = self.exposure_range.clone() else {
+        let Ok((min, max)) = self.exposure_range.clone() else {
             return self.refuse_exposure();
         };
         let Some(current) = self.exposure else {
             return self.error(EXPOSURE_UNKNOWN.into());
         };
-        self.set_exposure(snap(current, max, up), now)
+        // `snap` stays within 100..=max; a device range without a multiple of 100 in that
+        // direction would get a value it refuses.
+        let target = snap(current, max, up);
+        if !(min..=max).contains(&target) {
+            return self.error(format!("no flicker-free value in {min}..{max}"));
+        }
+        self.set_exposure(target, now)
     }
 
     fn set_exposure(&mut self, value: u32, now: Instant) -> Vec<Command> {
@@ -630,6 +636,29 @@ mod tests {
                 Some("mode unknown — press r to reload")
             );
         }
+    }
+
+    #[test]
+    fn snap_refuses_a_range_without_a_flicker_free_value() {
+        let now = Instant::now();
+        for (range, value, k) in [((1, 50), 20, ']'), ((150, 250), 200, '[')] {
+            let mut a = app();
+            a.exposure_range = Ok(range);
+            a.exposure = Some(value);
+            assert!(a.handle_key(key(KeyCode::Char(k)), now).is_empty());
+            assert_eq!(
+                a.message,
+                Some(format!("no flicker-free value in {}..{}", range.0, range.1))
+            );
+            assert_eq!(a.exposure, Some(value));
+            assert!(a.tick(now + Duration::from_secs(1)).is_empty());
+        }
+        // An unknown value is reported first.
+        let mut a = app();
+        a.exposure_range = Ok((1, 50));
+        a.exposure = None;
+        a.handle_key(key(KeyCode::Char(']')), now);
+        assert_eq!(a.message.as_deref(), Some(EXPOSURE_UNKNOWN));
     }
 
     #[test]
