@@ -165,9 +165,22 @@ impl UvcExposure {
         };
         // SAFETY: `transfer` is a valid usbdevfs_ctrltransfer whose `data` points at 4 bytes
         // that outlive the call, matching `length`.
-        unsafe { usbdevfs_control(self.file.as_raw_fd(), &mut transfer) }
+        let transferred = unsafe { usbdevfs_control(self.file.as_raw_fd(), &mut transfer) }
             .map_err(io::Error::from)?;
+        check_transferred(transferred)?;
         Ok(u32::from_le_bytes(data))
+    }
+}
+
+/// USBDEVFS_CONTROL returns how many bytes moved. A short GET would leave part of `data` as it
+/// was and read back as a wrong value; a short SET did not write the value. Both are errors.
+fn check_transferred(transferred: i32) -> io::Result<()> {
+    if transferred == 4 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "USB control transfer moved {transferred} of 4 bytes"
+        )))
     }
 }
 
@@ -201,6 +214,15 @@ mod tests {
         assert_eq!(mem::offset_of!(CtrlTransfer, length), 6);
         assert_eq!(mem::offset_of!(CtrlTransfer, timeout), 8);
         assert_eq!(mem::offset_of!(CtrlTransfer, data), 16);
+    }
+
+    #[test]
+    fn only_a_full_four_byte_transfer_counts() {
+        assert!(check_transferred(4).is_ok());
+        for short in [0, 1, 2, 3] {
+            let err = check_transferred(short).unwrap_err();
+            assert!(err.to_string().contains("of 4 bytes"), "{short}: {err}");
+        }
     }
 
     #[test]
