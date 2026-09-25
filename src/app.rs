@@ -172,8 +172,9 @@ impl App {
             KeyCode::Right => self.step(if shift { 10 } else { 1 }, now),
             KeyCode::PageDown => self.step(-100, now),
             KeyCode::PageUp => self.step(100, now),
-            KeyCode::Char('[') if self.focus != Focus::Mode => self.snap(false, now),
-            KeyCode::Char(']') if self.focus != Focus::Mode => self.snap(true, now),
+            // Exposure keys: on another control they would change a value that has no focus.
+            KeyCode::Char('[') if self.focus == Focus::Exposure => self.snap(false, now),
+            KeyCode::Char(']') if self.focus == Focus::Exposure => self.snap(true, now),
             KeyCode::Char('a') => self.toggle_mode(),
             KeyCode::Char('r') => self.read_all(),
             KeyCode::Enter | KeyCode::Char(':') if self.focus != Focus::Mode => {
@@ -563,6 +564,17 @@ mod tests {
             assert!(a.handle_key(key(KeyCode::Enter), now).is_empty());
             assert_eq!((a.entry.as_deref(), a.message.as_deref()), (None, None));
         }
+    }
+
+    #[test]
+    fn snap_keys_act_only_on_exposure_focus() {
+        let now = Instant::now();
+        let mut a = app();
+        a.focus = Focus::Brightness;
+        for k in ['[', ']'] {
+            assert!(a.handle_key(key(KeyCode::Char(k)), now).is_empty());
+        }
+        assert_eq!((a.exposure, a.brightness), (Some(200), Some(40)));
     }
 
     #[test]

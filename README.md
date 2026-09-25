@@ -29,7 +29,7 @@ Deck rules ship one). Without it, exposure is disabled and brightness and mode s
 | `←` `→` | −1 / +1 (on Mode: toggle) |
 | `Shift+←` `Shift+→` | −10 / +10 |
 | `PgDn` `PgUp` | −100 / +100 |
-| `[` `]` | previous / next multiple of 100 — flicker-free under 50 Hz light (below 100, `[` goes up to 100) |
+| `[` `]` | Exposure only: previous / next multiple of 100 — flicker-free under 50 Hz light (below 100, `[` goes up to 100) |
 | `a` | toggle Auto / Shutter Priority |
 | `Enter` or `:` | type a value; `Enter` applies, `Esc` cancels |
 | `r` | drop pending changes and read everything from the camera |
