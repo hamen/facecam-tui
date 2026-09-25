@@ -1,0 +1,48 @@
+# facecam-tui
+
+Terminal UI for the Elgato Facecam (USB `0fd9:0078`) on Linux: live preview, a realtime
+exposure slider, brightness, and Auto / Shutter Priority.
+
+The Linux `uvcvideo` driver keeps the Facecam's exposure time locked, because it only allows
+that control in "Manual" mode and the Facecam has no Manual mode. This tool writes the exposure
+time straight to the camera with a UVC request over usbfs, which works while the camera streams.
+
+## Install and run
+
+    cargo install --locked --path .
+    facecam-tui
+
+Run it in a terminal emulator. kitty shows the preview as a real image; other terminals get
+half-block characters. The preview needs the camera stream, which only one app can hold: while
+Meet (or any other app) uses the camera, the preview pane says so, and the controls still work —
+you see the change in the other app.
+
+Access: `/dev/video*` needs the `video` group. Exposure goes through `/dev/bus/usb/...`, which
+needs a udev rule such as `SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0666"` (the Stream
+Deck rules ship one). Without it, exposure is disabled and brightness and mode still work.
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `Tab` / `Shift+Tab` | next / previous control (Exposure → Brightness → Mode) |
+| `←` `→` | −1 / +1 (on Mode: toggle) |
+| `Shift+←` `Shift+→` | −10 / +10 |
+| `PgDn` `PgUp` | −100 / +100 |
+| `[` `]` | previous / next multiple of 100 — flicker-free under 50 Hz light (below 100, `[` goes up to 100) |
+| `a` | toggle Auto / Shutter Priority |
+| `Enter` or `:` | type a value; `Enter` applies, `Esc` cancels |
+| `r` | drop pending changes and read everything from the camera |
+| `q` / `Esc` / `Ctrl+C` | quit |
+
+Exposure is in units of 100 µs: 200 = 20 ms. Changing it switches the camera to Shutter Priority.
+Above 166, apps that capture at 60 fps drop frames; above 333, 30 fps drops too.
+
+## Development
+
+After you clone, enable the pre-push gate:
+
+    git config extensions.worktreeConfig true
+    git config --worktree core.hooksPath .githooks
+
+`bin/ci` runs `cargo fmt --check`, `cargo clippy -D warnings` and `cargo test`.
