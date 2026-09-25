@@ -178,15 +178,12 @@ enum Op {
 /// Applies one batch in `rev` order. Returns `Err` only when the camera is gone.
 pub fn apply(camera: &mut dyn Camera, batch: &Desired) -> Result<Applied, io::Error> {
     let mut exposure = batch.exposure;
-    if let (Some(e), Some((mode_rev, mode))) = (exposure.as_mut(), batch.mode)
+    // A newer Auto cancels the older exposure write. A newer Shutter keeps ensure_shutter:
+    // the exposure runs first (older rev), so it still needs Shutter Priority in place.
+    if let (Some(e), Some((mode_rev, Mode::Auto))) = (exposure.as_ref(), batch.mode)
         && mode_rev > e.rev
     {
-        match mode {
-            // A newer Auto cancels the older exposure write.
-            Mode::Auto => exposure = None,
-            // A newer explicit mode already covers what ensure_shutter would do.
-            Mode::Shutter => e.ensure_shutter = false,
-        }
+        exposure = None;
     }
 
     let mut ops: Vec<(u64, Op)> = Vec::new();
@@ -659,7 +656,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_shutter_mode_drops_the_redundant_ensure() {
+    fn newer_shutter_mode_keeps_the_ensure_for_the_older_exposure() {
         let mut batch = desired(&[Command::Exposure {
             rev: 1,
             value: 250,
@@ -668,7 +665,14 @@ mod tests {
         batch.mode = Some((2, Mode::Shutter));
         let mut cam = Fake::default();
         apply(&mut cam, &batch).unwrap();
-        assert_eq!(cam.calls, [Call::Exposure(250), Call::Mode(Mode::Shutter)]);
+        assert_eq!(
+            cam.calls,
+            [
+                Call::Mode(Mode::Shutter),
+                Call::Exposure(250),
+                Call::Mode(Mode::Shutter)
+            ]
+        );
     }
 
     #[test]
