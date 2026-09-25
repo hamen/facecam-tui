@@ -152,7 +152,9 @@ pub fn check_format(format: &Format, interval: Fraction) -> Result<(), String> {
             format.fourcc, format.width, format.height
         ));
     }
-    if interval.numerator * FPS != interval.denominator {
+    // A zero numerator would pass as 0 * 30 == 0, and a huge one would overflow the product.
+    if interval.numerator == 0 || interval.numerator.checked_mul(FPS) != Some(interval.denominator)
+    {
         return Err(format!(
             "driver set frame interval {interval}, wanted 1/{FPS}"
         ));
@@ -298,6 +300,13 @@ mod tests {
         assert!(check_format(&format(b"YUYV", 960, 540), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 1920, 1080), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 960, 540), Fraction::new(1, 60)).is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_or_overflowing_interval() {
+        let mjpg = format(b"MJPG", 960, 540);
+        assert!(check_format(&mjpg, Fraction::new(0, 0)).is_err());
+        assert!(check_format(&mjpg, Fraction::new(u32::MAX, 30)).is_err());
     }
 
     #[test]
