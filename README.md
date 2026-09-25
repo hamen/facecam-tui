@@ -9,6 +9,9 @@ time straight to the camera with a UVC request over usbfs, which works while the
 
 ## Install and run
 
+Build requirements: Rust stable, and libclang, because the `v4l` crate generates its bindings
+with bindgen (`apt install libclang-dev`, or any installed LLVM that ships `libclang.so`).
+
     cargo install --locked --path .
     facecam-tui
 
