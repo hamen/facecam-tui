@@ -147,6 +147,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.request_quit(now);
         }
+        // Other Ctrl and Alt chords are not bindings: Ctrl+A must not toggle the mode.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
         if self.entry.is_some() {
             return self.entry_key(key, now);
         }
@@ -517,6 +524,29 @@ mod tests {
         );
         assert_eq!(snap(1, 2500, false), 100);
         assert_eq!(snap(640, 650, true), 600, "top comes from the device max");
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_do_nothing() {
+        let mut a = app();
+        let now = Instant::now();
+        for k in [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        ] {
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+        }
+        assert!(!a.quit);
+        assert_eq!((a.mode, a.exposure), (Some(Mode::Shutter), Some(200)));
+
+        // Inside the entry too; Ctrl+C still quits.
+        a.handle_key(key(KeyCode::Enter), now);
+        a.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT), now);
+        assert_eq!(a.entry.as_deref(), Some(""));
+        a.handle_key(ctrl_c(), now);
+        assert!(a.quit);
     }
 
     #[test]
