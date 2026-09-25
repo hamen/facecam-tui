@@ -14,6 +14,7 @@ use std::{
 };
 
 use image::DynamicImage;
+use nix::errno::Errno;
 use v4l::{
     Device, Format, FourCC, Fraction,
     buffer::Type,
@@ -183,9 +184,9 @@ fn retries(status: &Status) -> bool {
 }
 
 fn classify(e: &io::Error) -> Status {
-    match e.raw_os_error() {
-        Some(16) => Status::Busy,
-        Some(13) => Status::NoAccess(e.to_string()),
+    match e.raw_os_error().map(Errno::from_raw) {
+        Some(Errno::EBUSY) => Status::Busy,
+        Some(Errno::EACCES) => Status::NoAccess(e.to_string()),
         _ if is_gone(e) || e.kind() == io::ErrorKind::NotFound => Status::Gone(e.to_string()),
         _ => Status::Error(e.to_string()),
     }
@@ -238,7 +239,9 @@ fn stream_once(
     let result = pump(&dev, &mut stream, slot, status, stop, seq);
     match v4l::io::traits::Stream::stop(&mut *stream) {
         Ok(()) => unsafe { ManuallyDrop::drop(&mut stream) },
-        Err(e) if e.raw_os_error() == Some(19) => unsafe { ManuallyDrop::drop(&mut stream) },
+        Err(e) if e.raw_os_error() == Some(Errno::ENODEV as i32) => unsafe {
+            ManuallyDrop::drop(&mut stream)
+        },
         Err(_) => {} // leaked on purpose: dropping it would panic
     }
     result
