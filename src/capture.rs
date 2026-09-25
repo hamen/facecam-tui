@@ -62,24 +62,48 @@ pub struct Capture {
 
 impl Capture {
     pub fn start(video: PathBuf, shared: Shared) -> Self {
+        Self::start_with(
+            |body| {
+                std::thread::Builder::new()
+                    .name("capture".into())
+                    .spawn(body)
+            },
+            video,
+            shared,
+        )
+    }
+
+    fn start_with(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+        video: PathBuf,
+        shared: Shared,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Slot::default();
         let (status, statuses) = mpsc::channel();
+        // A failed spawn drops the closure and the sender inside it, so report on a clone.
+        let spawn_status = status.clone();
         let (thread_stop, thread_slot) = (stop.clone(), slot.clone());
-        let handle = std::thread::Builder::new()
-            .name("capture".into())
-            .spawn(move || {
-                run(
-                    &video,
-                    &thread_slot,
-                    &status,
-                    &shared,
-                    &thread_stop,
-                    stream_once,
-                    RETRY,
-                );
-            })
-            .ok();
+        let body = Box::new(move || {
+            run(
+                &video,
+                &thread_slot,
+                &status,
+                &shared,
+                &thread_stop,
+                stream_once,
+                RETRY,
+            );
+        });
+        let handle = match spawn(body) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                let _ = spawn_status.send(Status::Error(format!(
+                    "could not start the capture thread: {e}"
+                )));
+                None
+            }
+        };
         Self {
             stop,
             handle,
@@ -330,6 +354,21 @@ mod tests {
         let mjpg = format(b"MJPG", 960, 540);
         assert!(check_format(&mjpg, Fraction::new(0, 0)).is_err());
         assert!(check_format(&mjpg, Fraction::new(u32::MAX, 30)).is_err());
+    }
+
+    #[test]
+    fn a_failed_spawn_reports_an_error() {
+        let capture = Capture::start_with(
+            |_| Err(io::Error::other("no threads")),
+            PathBuf::from("/nonexistent/video"),
+            Shared::default(),
+        );
+        assert_eq!(
+            capture.try_status(),
+            Some(Status::Error(
+                "could not start the capture thread: no threads".into()
+            ))
+        );
     }
 
     #[test]
