@@ -68,7 +68,17 @@ impl Capture {
         let (thread_stop, thread_slot) = (stop.clone(), slot.clone());
         let handle = std::thread::Builder::new()
             .name("capture".into())
-            .spawn(move || run(&video, &thread_slot, &status, &shared, &thread_stop))
+            .spawn(move || {
+                run(
+                    &video,
+                    &thread_slot,
+                    &status,
+                    &shared,
+                    &thread_stop,
+                    stream_once,
+                    RETRY,
+                );
+            })
             .ok();
         Self {
             stop,
@@ -104,11 +114,24 @@ impl Capture {
     }
 }
 
-fn run(video: &PathBuf, slot: &Slot, status: &Sender<Status>, shared: &Shared, stop: &AtomicBool) {
+/// Opens and streams one device.
+type StreamFn = fn(&PathBuf, &Slot, &Sender<Status>, &AtomicBool, &mut u64) -> io::Result<()>;
+
+fn run(
+    video: &PathBuf,
+    slot: &Slot,
+    status: &Sender<Status>,
+    shared: &Shared,
+    stop: &AtomicBool,
+    stream: StreamFn,
+    retry_after: Duration,
+) {
     let mut seq = 0;
+    // Once per capture: sending it before each retry made the pane alternate between
+    // "starting" and "camera in use" every retry.
+    let _ = status.send(Status::Starting);
     while !stop.load(Ordering::Relaxed) {
-        let _ = status.send(Status::Starting);
-        let outcome = stream_once(video, slot, status, stop, &mut seq);
+        let outcome = stream(video, slot, status, stop, &mut seq);
         let report = match outcome {
             Ok(()) => return, // stopped on request
             Err(e) => classify(&e),
@@ -121,7 +144,7 @@ fn run(video: &PathBuf, slot: &Slot, status: &Sender<Status>, shared: &Shared, s
         if !retry {
             return; // reported once; a new Capture starts on the next DeviceUp
         }
-        let end = Instant::now() + RETRY;
+        let end = Instant::now() + retry_after;
         while Instant::now() < end && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(POLL_MS as u64));
         }
@@ -307,6 +330,38 @@ mod tests {
         let mjpg = format(b"MJPG", 960, 540);
         assert!(check_format(&mjpg, Fraction::new(0, 0)).is_err());
         assert!(check_format(&mjpg, Fraction::new(u32::MAX, 30)).is_err());
+    }
+
+    #[test]
+    fn busy_retries_do_not_repeat_starting() {
+        fn busy_twice(
+            _: &PathBuf,
+            _: &Slot,
+            _: &Sender<Status>,
+            stop: &AtomicBool,
+            seq: &mut u64,
+        ) -> io::Result<()> {
+            // `seq` counts the calls here: two EBUSY failures, then a stop request.
+            *seq += 1;
+            if *seq <= 2 {
+                return Err(io::Error::from_raw_os_error(16));
+            }
+            stop.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        let (status, statuses) = mpsc::channel();
+        run(
+            &PathBuf::from("/nonexistent/video"),
+            &Slot::default(),
+            &status,
+            &Shared::default(),
+            &AtomicBool::new(false),
+            busy_twice,
+            Duration::ZERO,
+        );
+        drop(status);
+        let seen: Vec<Status> = statuses.iter().collect();
+        assert_eq!(seen, [Status::Starting, Status::Busy, Status::Busy]);
     }
 
     #[test]
