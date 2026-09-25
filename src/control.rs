@@ -366,11 +366,12 @@ pub fn run(shared: Shared, events: Sender<Event>, sysfs: PathBuf, dev: PathBuf) 
             ranges,
         });
 
+        let present = || usb::check_presence(&sysfs, &dev, &found);
         let reason = serve(
             &shared,
             &events,
             &mut camera,
-            &found,
+            &present,
             generation,
             &mut last_rev,
         );
@@ -401,7 +402,7 @@ fn serve(
     shared: &Shared,
     events: &Sender<Event>,
     camera: &mut dyn Camera,
-    found: &usb::Found,
+    present: &dyn Fn() -> usb::Presence,
     generation: u64,
     last_rev: &mut u64,
 ) -> Served {
@@ -421,6 +422,7 @@ fn serve(
     }
     let mut reread_at = Some(Instant::now() + REREAD_AFTER_UP);
     let mut presence_at = Instant::now() + PRESENCE_CHECK;
+    let mut changed_once = false;
 
     loop {
         let batch = shared.take(POLL);
@@ -428,8 +430,17 @@ fn serve(
 
         if batch.check || now >= presence_at {
             presence_at = now + PRESENCE_CHECK;
-            if !found.usb_node.exists() {
-                return Served::Gone("camera disconnected".to_string());
+            match present() {
+                usb::Presence::Same => changed_once = false,
+                usb::Presence::Disconnected => {
+                    return Served::Gone("camera disconnected".to_string());
+                }
+                // One differing read can be a failed sysfs read; two in a row is a rebind
+                // with other nodes, and the session on the old nodes is dead.
+                usb::Presence::Changed if changed_once => {
+                    return Served::Gone("camera nodes changed".to_string());
+                }
+                usb::Presence::Changed => changed_once = true,
             }
         }
 
@@ -772,29 +783,52 @@ mod tests {
         shared: Shared,
         events: std::sync::mpsc::Receiver<Event>,
         handle: std::thread::JoinHandle<Served>,
-        _usb: tempfile::NamedTempFile,
+        /// Answers for the next presence checks, in order; `Same` once it is empty.
+        presence: Arc<Mutex<std::collections::VecDeque<usb::Presence>>>,
+        checks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Harness {
+        /// Queues the presence answers, asks for a check, and waits until that check ran.
+        fn check(&self, answers: &[usb::Presence]) {
+            self.presence.lock().unwrap().extend(answers);
+            let before = self.checks.load(std::sync::atomic::Ordering::SeqCst);
+            self.shared.request_check();
+            let end = Instant::now() + Duration::from_secs(2);
+            while self.checks.load(std::sync::atomic::Ordering::SeqCst) == before {
+                assert!(Instant::now() < end, "no presence check ran");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
     }
 
     fn serve_fake(cam: Fake) -> Harness {
-        let usb = tempfile::NamedTempFile::new().unwrap();
-        let found = usb::Found {
-            sysname: "6-3".into(),
-            usb_node: usb.path().to_path_buf(),
-            video_node: None,
-        };
         let shared = Shared::default();
         let (tx, events) = std::sync::mpsc::channel();
+        let presence = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_shared = shared.clone();
+        let (thread_presence, thread_checks) = (presence.clone(), checks.clone());
         let handle = std::thread::spawn(move || {
             let mut cam = cam;
             let mut last_rev = 0;
-            serve(&thread_shared, &tx, &mut cam, &found, 1, &mut last_rev)
+            let present = || {
+                let answer = thread_presence
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(usb::Presence::Same);
+                thread_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                answer
+            };
+            serve(&thread_shared, &tx, &mut cam, &present, 1, &mut last_rev)
         });
         Harness {
             shared,
             events,
             handle,
-            _usb: usb,
+            presence,
+            checks,
         }
     }
 
@@ -864,9 +898,41 @@ mod tests {
     fn serve_notices_the_usb_node_disappearing() {
         let s = serve_fake(Fake::default());
         next_event(&s.events);
-        std::fs::remove_file(s._usb.path()).unwrap();
+        s.presence
+            .lock()
+            .unwrap()
+            .push_back(usb::Presence::Disconnected);
         s.shared.request_check();
-        assert!(matches!(s.handle.join().unwrap(), Served::Gone(_)));
+        assert_eq!(
+            s.handle.join().unwrap(),
+            Served::Gone("camera disconnected".into())
+        );
+    }
+
+    #[test]
+    fn one_changed_read_does_not_end_the_session() {
+        let s = serve_fake(Fake::default());
+        next_event(&s.events);
+        s.check(&[usb::Presence::Changed]);
+        s.check(&[usb::Presence::Same]);
+        s.check(&[usb::Presence::Changed]);
+        s.shared.submit([Command::ReadAll { rev: 7 }]);
+        assert_eq!(values_rev(next_event(&s.events)), 7);
+        s.shared.submit([Command::Quit { rev: 8 }]);
+        assert_eq!(s.handle.join().unwrap(), Served::Quit);
+    }
+
+    #[test]
+    fn two_changed_reads_in_a_row_end_the_session() {
+        let s = serve_fake(Fake::default());
+        next_event(&s.events);
+        s.check(&[usb::Presence::Changed]);
+        s.presence.lock().unwrap().push_back(usb::Presence::Changed);
+        s.shared.request_check();
+        assert_eq!(
+            s.handle.join().unwrap(),
+            Served::Gone("camera nodes changed".into())
+        );
     }
 
     #[test]

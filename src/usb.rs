@@ -56,6 +56,29 @@ pub fn discover(sysfs: &Path, dev: &Path) -> Option<Found> {
 
 /// The capture node of a USB device. A video node's real path is under the USB *interface*
 /// (`.../6-3/6-3:1.0/video4linux/video0`), which is itself under the device directory.
+/// What a presence check sees, compared with the camera the worker opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Discovery finds the same device and nodes.
+    Same,
+    /// The usbfs node is gone: the camera was unplugged.
+    Disconnected,
+    /// The device is there but discovery differs: the driver bound again with other nodes, or a
+    /// sysfs read failed. Not conclusive on its own; the caller confirms it on the next check.
+    Changed,
+}
+
+pub fn check_presence(sysfs: &Path, dev: &Path, found: &Found) -> Presence {
+    if !found.usb_node.exists() {
+        return Presence::Disconnected;
+    }
+    if discover(sysfs, dev).as_ref() == Some(found) {
+        Presence::Same
+    } else {
+        Presence::Changed
+    }
+}
+
 fn video_node_for(sysfs: &Path, dev: &Path, device: &Path) -> Option<PathBuf> {
     let device = fs::canonicalize(device).ok()?;
     sorted_entries(&sysfs.join("class/video4linux"))
@@ -264,6 +287,26 @@ mod tests {
             symlink(&dir, self.sys().join("bus/usb/devices").join(name)).unwrap();
         }
 
+        /// The usbfs node file that `discover` points at.
+        fn add_usb_node(&self, bus: u32, num: u32) -> PathBuf {
+            let node = self.dev().join(format!("bus/usb/{bus:03}/{num:03}"));
+            fs::create_dir_all(node.parent().unwrap()).unwrap();
+            fs::write(&node, "").unwrap();
+            node
+        }
+
+        fn remove_video(&self, usb: &str, video: &str) {
+            fs::remove_file(self.sys().join("class/video4linux").join(video)).unwrap();
+            fs::remove_dir_all(
+                self.sys()
+                    .join("devices/usb6")
+                    .join(usb)
+                    .join(format!("{usb}:1.0/video4linux"))
+                    .join(video),
+            )
+            .unwrap();
+        }
+
         fn add_video(&self, usb: &str, video: &str, index: u32) {
             let dir = self
                 .sys()
@@ -317,6 +360,53 @@ mod tests {
         assert_eq!(discover(&f.sys(), &f.dev()), None);
         f.add_usb("6-3", "0fd9", "0078", 6, 7);
         assert_eq!(discover(&f.sys(), &f.dev()).unwrap().video_node, None);
+    }
+
+    fn opened_facecam() -> (Fixture, Found) {
+        let f = Fixture::new();
+        f.add_usb("6-3", "0fd9", "0078", 6, 7);
+        f.add_usb_node(6, 7);
+        f.add_video("6-3", "video0", 0);
+        f.add_video("6-3", "video1", 1);
+        let found = discover(&f.sys(), &f.dev()).unwrap();
+        (f, found)
+    }
+
+    #[test]
+    fn presence_is_same_while_nothing_changes() {
+        let (f, found) = opened_facecam();
+        assert_eq!(check_presence(&f.sys(), &f.dev(), &found), Presence::Same);
+    }
+
+    #[test]
+    fn a_renumbered_capture_node_is_a_change() {
+        let (f, found) = opened_facecam();
+        f.remove_video("6-3", "video0");
+        f.add_video("6-3", "video2", 0);
+        assert_eq!(
+            check_presence(&f.sys(), &f.dev(), &found),
+            Presence::Changed
+        );
+    }
+
+    #[test]
+    fn an_unbound_capture_node_is_a_change() {
+        let (f, found) = opened_facecam();
+        f.remove_video("6-3", "video0");
+        assert_eq!(
+            check_presence(&f.sys(), &f.dev(), &found),
+            Presence::Changed
+        );
+    }
+
+    #[test]
+    fn a_missing_usb_node_is_a_disconnect() {
+        let (f, found) = opened_facecam();
+        fs::remove_file(&found.usb_node).unwrap();
+        assert_eq!(
+            check_presence(&f.sys(), &f.dev(), &found),
+            Presence::Disconnected
+        );
     }
 
     /// Runs against the real camera: `cargo test -- --ignored`. Restores the exposure it found.
