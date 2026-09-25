@@ -29,9 +29,18 @@ use crate::{
     control::{Event, Shared},
 };
 
-/// One kitty image id for every frame: a new frame replaces the old image instead of piling up
-/// in the terminal's image store.
-const KITTY_IMAGE_ID: u32 = 0x00fa_ce01;
+/// Frames alternate between two kitty image ids, so the store holds at most two images.
+///
+/// Two, not one: the id is also the foreground colour of every placeholder cell, so alternating
+/// changes every cell and ratatui rewrites them all each frame. With a single id only the first
+/// cell (which carries the transmission) changes, and kitty then shows a large frame's first row
+/// of cells and nothing below it (reproduced with a 1200x675 RGBA frame). It also keeps the frame
+/// on screen intact while the next one is still being transmitted.
+const KITTY_IMAGE_IDS: [u32; 2] = [0x00fa_ce01, 0x00fa_ce02];
+
+fn kitty_image_id(seq: u64) -> u32 {
+    KITTY_IMAGE_IDS[(seq % 2) as usize]
+}
 /// The UI wakes at least this often while the preview runs, so new frames show without keys.
 const FRAME_WAKE: Duration = Duration::from_millis(66);
 const IDLE_WAKE: Duration = Duration::from_millis(250);
@@ -118,7 +127,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
             && frame.seq != last_seq
         {
             last_seq = frame.seq;
-            protocol = Some(new_protocol(picker, frame.image));
+            protocol = Some(new_protocol(picker, frame.image, kitty_image_id(frame.seq)));
         }
 
         terminal.draw(|f| {
@@ -179,14 +188,14 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
     Ok(())
 }
 
-fn new_protocol(picker: &Picker, image: DynamicImage) -> StatefulProtocol {
+fn new_protocol(picker: &Picker, image: DynamicImage, kitty_id: u32) -> StatefulProtocol {
     if picker.protocol_type() != ProtocolType::Kitty {
         return picker.new_resize_protocol(image);
     }
     let compress = picker
         .capabilities()
         .contains(&Capability::KittyCompression);
-    let kitty = StatefulKitty::new(KITTY_IMAGE_ID, picker.tmux_detected(), compress);
+    let kitty = StatefulKitty::new(kitty_id, picker.tmux_detected(), compress);
     StatefulProtocol::new(
         image,
         picker.font_size(),
@@ -208,4 +217,25 @@ fn delete_kitty_images() -> Result<()> {
     out.write_all(term::KITTY_DELETE_ALL.as_bytes())?;
     out.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn consecutive_frames_use_different_kitty_ids() {
+        for seq in 1..6 {
+            let (a, b) = (kitty_image_id(seq), kitty_image_id(seq + 1));
+            assert_ne!(a, b, "seq {seq}");
+            // The low 24 bits are the placeholder cells' colour: they must differ too, or ratatui
+            // sees unchanged cells and skips them.
+            assert_ne!(a & 0x00ff_ffff, b & 0x00ff_ffff, "seq {seq}");
+        }
+        assert_eq!(
+            kitty_image_id(1),
+            kitty_image_id(3),
+            "only two ids in the store"
+        );
+    }
 }
