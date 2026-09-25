@@ -204,6 +204,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let text = self.entry.take().unwrap_or_default();
+                // An empty entry closes like Esc: it is not an out-of-range value.
+                if text.is_empty() {
+                    return Vec::new();
+                }
                 self.apply_typed(&text, now)
             }
             _ => Vec::new(),
@@ -547,6 +551,18 @@ mod tests {
         assert_eq!(a.entry.as_deref(), Some(""));
         a.handle_key(ctrl_c(), now);
         assert!(a.quit);
+    }
+
+    #[test]
+    fn enter_on_an_empty_entry_closes_it_quietly() {
+        let now = Instant::now();
+        for focus in [Focus::Exposure, Focus::Brightness] {
+            let mut a = app();
+            a.focus = focus;
+            a.handle_key(key(KeyCode::Enter), now);
+            assert!(a.handle_key(key(KeyCode::Enter), now).is_empty());
+            assert_eq!((a.entry.as_deref(), a.message.as_deref()), (None, None));
+        }
     }
 
     #[test]
