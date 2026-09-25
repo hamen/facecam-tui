@@ -187,7 +187,7 @@ fn help(app: &App) -> String {
     if app.entry.is_some() {
         return "digits · Backspace · Enter apply · Esc cancel · Ctrl+C quit".into();
     }
-    "Tab focus · ←/→ ±1 · Shift ±10 · PgUp/PgDn ±100 · [ ] ±flicker-free (below 100: up to 100) \
+    "Tab focus · ←/→ ±1 · Shift ±10 · PgUp/PgDn ±100 · [ ] ±flicker-free (Exposure; below 100: up to 100) \
      · a auto · Enter type · r reload · q quit"
         .into()
 }

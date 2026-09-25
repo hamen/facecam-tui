@@ -14,6 +14,7 @@ use std::{
 };
 
 use image::DynamicImage;
+use nix::errno::Errno;
 use v4l::{
     Device, Format, FourCC, Fraction,
     buffer::Type,
@@ -62,14 +63,48 @@ pub struct Capture {
 
 impl Capture {
     pub fn start(video: PathBuf, shared: Shared) -> Self {
+        Self::start_with(
+            |body| {
+                std::thread::Builder::new()
+                    .name("capture".into())
+                    .spawn(body)
+            },
+            video,
+            shared,
+        )
+    }
+
+    fn start_with(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<JoinHandle<()>>,
+        video: PathBuf,
+        shared: Shared,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Slot::default();
         let (status, statuses) = mpsc::channel();
+        // A failed spawn drops the closure and the sender inside it, so report on a clone.
+        let spawn_status = status.clone();
         let (thread_stop, thread_slot) = (stop.clone(), slot.clone());
-        let handle = std::thread::Builder::new()
-            .name("capture".into())
-            .spawn(move || run(&video, &thread_slot, &status, &shared, &thread_stop))
-            .ok();
+        let body = Box::new(move || {
+            run(
+                &video,
+                &thread_slot,
+                &status,
+                &shared,
+                &thread_stop,
+                stream_once,
+                RETRY,
+            );
+        });
+        let handle = match spawn(body) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                let _ = spawn_status.send(Status::Error(format!(
+                    "could not start the capture thread: {e}"
+                )));
+                None
+            }
+        };
         Self {
             stop,
             handle,
@@ -104,11 +139,24 @@ impl Capture {
     }
 }
 
-fn run(video: &PathBuf, slot: &Slot, status: &Sender<Status>, shared: &Shared, stop: &AtomicBool) {
+/// Opens and streams one device.
+type StreamFn = fn(&PathBuf, &Slot, &Sender<Status>, &AtomicBool, &mut u64) -> io::Result<()>;
+
+fn run(
+    video: &PathBuf,
+    slot: &Slot,
+    status: &Sender<Status>,
+    shared: &Shared,
+    stop: &AtomicBool,
+    stream: StreamFn,
+    retry_after: Duration,
+) {
     let mut seq = 0;
+    // Once per capture: sending it before each retry made the pane alternate between
+    // "starting" and "camera in use" every retry.
+    let _ = status.send(Status::Starting);
     while !stop.load(Ordering::Relaxed) {
-        let _ = status.send(Status::Starting);
-        let outcome = stream_once(video, slot, status, stop, &mut seq);
+        let outcome = stream(video, slot, status, stop, &mut seq);
         let report = match outcome {
             Ok(()) => return, // stopped on request
             Err(e) => classify(&e),
@@ -121,7 +169,7 @@ fn run(video: &PathBuf, slot: &Slot, status: &Sender<Status>, shared: &Shared, s
         if !retry {
             return; // reported once; a new Capture starts on the next DeviceUp
         }
-        let end = Instant::now() + RETRY;
+        let end = Instant::now() + retry_after;
         while Instant::now() < end && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(POLL_MS as u64));
         }
@@ -136,9 +184,9 @@ fn retries(status: &Status) -> bool {
 }
 
 fn classify(e: &io::Error) -> Status {
-    match e.raw_os_error() {
-        Some(16) => Status::Busy,
-        Some(13) => Status::NoAccess(e.to_string()),
+    match e.raw_os_error().map(Errno::from_raw) {
+        Some(Errno::EBUSY) => Status::Busy,
+        Some(Errno::EACCES) => Status::NoAccess(e.to_string()),
         _ if is_gone(e) || e.kind() == io::ErrorKind::NotFound => Status::Gone(e.to_string()),
         _ => Status::Error(e.to_string()),
     }
@@ -152,7 +200,9 @@ pub fn check_format(format: &Format, interval: Fraction) -> Result<(), String> {
             format.fourcc, format.width, format.height
         ));
     }
-    if interval.numerator * FPS != interval.denominator {
+    // A zero numerator would pass as 0 * 30 == 0, and a huge one would overflow the product.
+    if interval.numerator == 0 || interval.numerator.checked_mul(FPS) != Some(interval.denominator)
+    {
         return Err(format!(
             "driver set frame interval {interval}, wanted 1/{FPS}"
         ));
@@ -189,7 +239,9 @@ fn stream_once(
     let result = pump(&dev, &mut stream, slot, status, stop, seq);
     match v4l::io::traits::Stream::stop(&mut *stream) {
         Ok(()) => unsafe { ManuallyDrop::drop(&mut stream) },
-        Err(e) if e.raw_os_error() == Some(19) => unsafe { ManuallyDrop::drop(&mut stream) },
+        Err(e) if e.raw_os_error() == Some(Errno::ENODEV as i32) => unsafe {
+            ManuallyDrop::drop(&mut stream)
+        },
         Err(_) => {} // leaked on purpose: dropping it would panic
     }
     result
@@ -298,6 +350,60 @@ mod tests {
         assert!(check_format(&format(b"YUYV", 960, 540), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 1920, 1080), Fraction::new(1, 30)).is_err());
         assert!(check_format(&format(b"MJPG", 960, 540), Fraction::new(1, 60)).is_err());
+    }
+
+    #[test]
+    fn rejects_a_zero_or_overflowing_interval() {
+        let mjpg = format(b"MJPG", 960, 540);
+        assert!(check_format(&mjpg, Fraction::new(0, 0)).is_err());
+        assert!(check_format(&mjpg, Fraction::new(u32::MAX, 30)).is_err());
+    }
+
+    #[test]
+    fn a_failed_spawn_reports_an_error() {
+        let capture = Capture::start_with(
+            |_| Err(io::Error::other("no threads")),
+            PathBuf::from("/nonexistent/video"),
+            Shared::default(),
+        );
+        assert_eq!(
+            capture.try_status(),
+            Some(Status::Error(
+                "could not start the capture thread: no threads".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn busy_retries_do_not_repeat_starting() {
+        fn busy_twice(
+            _: &PathBuf,
+            _: &Slot,
+            _: &Sender<Status>,
+            stop: &AtomicBool,
+            seq: &mut u64,
+        ) -> io::Result<()> {
+            // `seq` counts the calls here: two EBUSY failures, then a stop request.
+            *seq += 1;
+            if *seq <= 2 {
+                return Err(io::Error::from_raw_os_error(16));
+            }
+            stop.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+        let (status, statuses) = mpsc::channel();
+        run(
+            &PathBuf::from("/nonexistent/video"),
+            &Slot::default(),
+            &status,
+            &Shared::default(),
+            &AtomicBool::new(false),
+            busy_twice,
+            Duration::ZERO,
+        );
+        drop(status);
+        let seen: Vec<Status> = statuses.iter().collect();
+        assert_eq!(seen, [Status::Starting, Status::Busy, Status::Busy]);
     }
 
     #[test]

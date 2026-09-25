@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use nix::errno::Errno;
+
 use crate::{
     camera::{Camera, Facecam, Mode},
     usb,
@@ -149,15 +151,9 @@ pub enum Event {
 /// Errors that mean the camera is no longer there.
 pub fn is_gone(error: &io::Error) -> bool {
     matches!(
-        error.raw_os_error(),
-        Some(libc_errno::ENODEV | libc_errno::ESHUTDOWN | libc_errno::ENXIO)
+        error.raw_os_error().map(Errno::from_raw),
+        Some(Errno::ENODEV | Errno::ESHUTDOWN | Errno::ENXIO)
     )
-}
-
-mod libc_errno {
-    pub const ENXIO: i32 = 6;
-    pub const ENODEV: i32 = 19;
-    pub const ESHUTDOWN: i32 = 108;
 }
 
 /// What one batch did.

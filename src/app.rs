@@ -17,6 +17,8 @@ pub const BAR_MAX: u32 = 333;
 /// Above this, apps capturing at 60 fps drop frames (1/60 s = 166 × 100 µs).
 pub const FPS60_MAX: u32 = 166;
 
+const EXPOSURE_UNKNOWN: &str = "exposure value unknown — press r to reload";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Exposure,
@@ -147,6 +149,13 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.request_quit(now);
         }
+        // Other Ctrl and Alt chords are not bindings: Ctrl+A must not toggle the mode.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Vec::new();
+        }
         if self.entry.is_some() {
             return self.entry_key(key, now);
         }
@@ -165,8 +174,9 @@ impl App {
             KeyCode::Right => self.step(if shift { 10 } else { 1 }, now),
             KeyCode::PageDown => self.step(-100, now),
             KeyCode::PageUp => self.step(100, now),
-            KeyCode::Char('[') if self.focus != Focus::Mode => self.snap(false, now),
-            KeyCode::Char(']') if self.focus != Focus::Mode => self.snap(true, now),
+            // Exposure keys: on another control they would change a value that has no focus.
+            KeyCode::Char('[') if self.focus == Focus::Exposure => self.snap(false, now),
+            KeyCode::Char(']') if self.focus == Focus::Exposure => self.snap(true, now),
             KeyCode::Char('a') => self.toggle_mode(),
             KeyCode::Char('r') => self.read_all(),
             KeyCode::Enter | KeyCode::Char(':') if self.focus != Focus::Mode => {
@@ -197,6 +207,10 @@ impl App {
             }
             KeyCode::Enter => {
                 let text = self.entry.take().unwrap_or_default();
+                // An empty entry closes like Esc: it is not an out-of-range value.
+                if text.is_empty() {
+                    return Vec::new();
+                }
                 self.apply_typed(&text, now)
             }
             _ => Vec::new(),
@@ -248,15 +262,17 @@ impl App {
                     return self.refuse_exposure();
                 };
                 let Some(current) = self.exposure else {
-                    return Vec::new();
+                    return self.error(EXPOSURE_UNKNOWN.into());
                 };
                 let v = (i64::from(current) + delta).clamp(i64::from(min), i64::from(max));
                 self.set_exposure(v as u32, now)
             }
             Focus::Brightness => {
-                let (Some((min, max)), Some(current)) = (self.brightness_range, self.brightness)
-                else {
-                    return Vec::new();
+                let Some((min, max)) = self.brightness_range else {
+                    return self.error("brightness range unknown".into());
+                };
+                let Some(current) = self.brightness else {
+                    return self.error("brightness value unknown — press r to reload".into());
                 };
                 self.set_brightness((current + delta).clamp(min, max))
             }
@@ -267,13 +283,19 @@ impl App {
     }
 
     fn snap(&mut self, up: bool, now: Instant) -> Vec<Command> {
-        let Ok((_, max)) = self.exposure_range.clone() else {
+        let Ok((min, max)) = self.exposure_range.clone() else {
             return self.refuse_exposure();
         };
         let Some(current) = self.exposure else {
-            return Vec::new();
+            return self.error(EXPOSURE_UNKNOWN.into());
         };
-        self.set_exposure(snap(current, max, up), now)
+        // `snap` stays within 100..=max; a device range without a multiple of 100 in that
+        // direction would get a value it refuses.
+        let target = snap(current, max, up);
+        if !(min..=max).contains(&target) {
+            return self.error(format!("no flicker-free value in {min}..{max}"));
+        }
+        self.set_exposure(target, now)
     }
 
     fn set_exposure(&mut self, value: u32, now: Instant) -> Vec<Command> {
@@ -307,7 +329,7 @@ impl App {
 
     fn toggle_mode(&mut self) -> Vec<Command> {
         let Some(mode) = self.mode else {
-            return Vec::new();
+            return self.error("mode unknown — press r to reload".into());
         };
         let mode = mode.toggled();
         // Auto cancels a held exposure; Shutter Priority sends it first.
@@ -517,6 +539,126 @@ mod tests {
         );
         assert_eq!(snap(1, 2500, false), 100);
         assert_eq!(snap(640, 650, true), 600, "top comes from the device max");
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_do_nothing() {
+        let mut a = app();
+        let now = Instant::now();
+        for k in [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        ] {
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+        }
+        assert!(!a.quit);
+        assert_eq!((a.mode, a.exposure), (Some(Mode::Shutter), Some(200)));
+
+        // Inside the entry too; Ctrl+C still quits.
+        a.handle_key(key(KeyCode::Enter), now);
+        a.handle_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT), now);
+        assert_eq!(a.entry.as_deref(), Some(""));
+        a.handle_key(ctrl_c(), now);
+        assert!(a.quit);
+    }
+
+    #[test]
+    fn enter_on_an_empty_entry_closes_it_quietly() {
+        let now = Instant::now();
+        for focus in [Focus::Exposure, Focus::Brightness] {
+            let mut a = app();
+            a.focus = focus;
+            a.handle_key(key(KeyCode::Enter), now);
+            assert!(a.handle_key(key(KeyCode::Enter), now).is_empty());
+            assert_eq!((a.entry.as_deref(), a.message.as_deref()), (None, None));
+        }
+    }
+
+    #[test]
+    fn snap_keys_act_only_on_exposure_focus() {
+        let now = Instant::now();
+        let mut a = app();
+        a.focus = Focus::Brightness;
+        for k in ['[', ']'] {
+            assert!(a.handle_key(key(KeyCode::Char(k)), now).is_empty());
+        }
+        assert_eq!((a.exposure, a.brightness), (Some(200), Some(40)));
+    }
+
+    #[test]
+    fn keys_on_an_unknown_value_say_so() {
+        let now = Instant::now();
+        let exposure = [
+            key(KeyCode::Right),
+            shift(KeyCode::Right),
+            key(KeyCode::PageUp),
+            key(KeyCode::Char('[')),
+        ];
+        for k in exposure {
+            let mut a = app();
+            a.exposure = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(a.message.as_deref(), Some(EXPOSURE_UNKNOWN), "{k:?}");
+        }
+        for k in [
+            key(KeyCode::Right),
+            key(KeyCode::PageDown),
+            shift(KeyCode::Left),
+        ] {
+            let mut a = app();
+            a.focus = Focus::Brightness;
+            a.brightness = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(
+                a.message.as_deref(),
+                Some("brightness value unknown — press r to reload"),
+                "{k:?}"
+            );
+        }
+        let mut a = app();
+        a.focus = Focus::Brightness;
+        a.brightness_range = None;
+        assert!(a.handle_key(key(KeyCode::Right), now).is_empty());
+        assert_eq!(a.message.as_deref(), Some("brightness range unknown"));
+
+        for (focus, k) in [
+            (Focus::Exposure, key(KeyCode::Char('a'))),
+            (Focus::Mode, key(KeyCode::Right)),
+        ] {
+            let mut a = app();
+            a.focus = focus;
+            a.mode = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(
+                a.message.as_deref(),
+                Some("mode unknown — press r to reload")
+            );
+        }
+    }
+
+    #[test]
+    fn snap_refuses_a_range_without_a_flicker_free_value() {
+        let now = Instant::now();
+        for (range, value, k) in [((1, 50), 20, ']'), ((150, 250), 200, '[')] {
+            let mut a = app();
+            a.exposure_range = Ok(range);
+            a.exposure = Some(value);
+            assert!(a.handle_key(key(KeyCode::Char(k)), now).is_empty());
+            assert_eq!(
+                a.message,
+                Some(format!("no flicker-free value in {}..{}", range.0, range.1))
+            );
+            assert_eq!(a.exposure, Some(value));
+            assert!(a.tick(now + Duration::from_secs(1)).is_empty());
+        }
+        // An unknown value is reported first.
+        let mut a = app();
+        a.exposure_range = Ok((1, 50));
+        a.exposure = None;
+        a.handle_key(key(KeyCode::Char(']')), now);
+        assert_eq!(a.message.as_deref(), Some(EXPOSURE_UNKNOWN));
     }
 
     #[test]

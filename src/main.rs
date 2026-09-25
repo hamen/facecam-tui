@@ -41,6 +41,28 @@ const KITTY_IMAGE_IDS: [u32; 2] = [0x00fa_ce01, 0x00fa_ce02];
 fn kitty_image_id(seq: u64) -> u32 {
     KITTY_IMAGE_IDS[(seq % 2) as usize]
 }
+/// Lets each frame through once. Every capture numbers its frames from 1, so the gate is reset
+/// when a capture starts or stops; otherwise a new capture's frame with the old capture's last
+/// number would be dropped.
+#[derive(Default)]
+struct FrameGate {
+    last_seq: u64,
+}
+
+impl FrameGate {
+    fn accept(&mut self, seq: u64) -> bool {
+        if seq == self.last_seq {
+            return false;
+        }
+        self.last_seq = seq;
+        true
+    }
+
+    fn reset(&mut self) {
+        self.last_seq = 0;
+    }
+}
+
 /// The UI wakes at least this often while the preview runs, so new frames show without keys.
 const FRAME_WAKE: Duration = Duration::from_millis(66);
 const IDLE_WAKE: Duration = Duration::from_millis(250);
@@ -88,7 +110,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
     let mut app = App::default();
     let mut capture: Option<(PathBuf, Capture)> = None;
     let mut protocol: Option<StatefulProtocol> = None;
-    let mut last_seq = 0;
+    let mut frames = FrameGate::default();
 
     loop {
         let now = Instant::now();
@@ -104,12 +126,14 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
                             video_node.clone(),
                             Capture::start(video_node.clone(), shared.clone()),
                         ));
+                        frames.reset();
                     }
                 }
                 Event::Gone { .. } => {
                     if let Some((_, old)) = capture.take() {
                         old.stop(Duration::from_millis(500));
                     }
+                    frames.reset();
                     clear_preview(&mut protocol, kitty)?;
                 }
                 _ => {}
@@ -124,9 +148,8 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
             }
         }
         if let Some(frame) = capture.as_ref().and_then(|(_, c)| c.take_frame())
-            && frame.seq != last_seq
+            && frames.accept(frame.seq)
         {
-            last_seq = frame.seq;
             protocol = Some(new_protocol(picker, frame.image, kitty_image_id(frame.seq)));
         }
 
@@ -222,6 +245,15 @@ fn delete_kitty_images() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_gate_lets_a_new_capture_start_from_one() {
+        let mut gate = FrameGate::default();
+        assert!(gate.accept(1));
+        assert!(!gate.accept(1), "the same frame twice");
+        gate.reset();
+        assert!(gate.accept(1), "a new capture's first frame");
+    }
 
     #[test]
     fn consecutive_frames_use_different_kitty_ids() {
