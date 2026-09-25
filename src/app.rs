@@ -17,6 +17,8 @@ pub const BAR_MAX: u32 = 333;
 /// Above this, apps capturing at 60 fps drop frames (1/60 s = 166 × 100 µs).
 pub const FPS60_MAX: u32 = 166;
 
+const EXPOSURE_UNKNOWN: &str = "exposure value unknown — press r to reload";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Exposure,
@@ -260,15 +262,17 @@ impl App {
                     return self.refuse_exposure();
                 };
                 let Some(current) = self.exposure else {
-                    return Vec::new();
+                    return self.error(EXPOSURE_UNKNOWN.into());
                 };
                 let v = (i64::from(current) + delta).clamp(i64::from(min), i64::from(max));
                 self.set_exposure(v as u32, now)
             }
             Focus::Brightness => {
-                let (Some((min, max)), Some(current)) = (self.brightness_range, self.brightness)
-                else {
-                    return Vec::new();
+                let Some((min, max)) = self.brightness_range else {
+                    return self.error("brightness range unknown".into());
+                };
+                let Some(current) = self.brightness else {
+                    return self.error("brightness value unknown — press r to reload".into());
                 };
                 self.set_brightness((current + delta).clamp(min, max))
             }
@@ -283,7 +287,7 @@ impl App {
             return self.refuse_exposure();
         };
         let Some(current) = self.exposure else {
-            return Vec::new();
+            return self.error(EXPOSURE_UNKNOWN.into());
         };
         self.set_exposure(snap(current, max, up), now)
     }
@@ -319,7 +323,7 @@ impl App {
 
     fn toggle_mode(&mut self) -> Vec<Command> {
         let Some(mode) = self.mode else {
-            return Vec::new();
+            return self.error("mode unknown — press r to reload".into());
         };
         let mode = mode.toggled();
         // Auto cancels a held exposure; Shutter Priority sends it first.
@@ -575,6 +579,57 @@ mod tests {
             assert!(a.handle_key(key(KeyCode::Char(k)), now).is_empty());
         }
         assert_eq!((a.exposure, a.brightness), (Some(200), Some(40)));
+    }
+
+    #[test]
+    fn keys_on_an_unknown_value_say_so() {
+        let now = Instant::now();
+        let exposure = [
+            key(KeyCode::Right),
+            shift(KeyCode::Right),
+            key(KeyCode::PageUp),
+            key(KeyCode::Char('[')),
+        ];
+        for k in exposure {
+            let mut a = app();
+            a.exposure = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(a.message.as_deref(), Some(EXPOSURE_UNKNOWN), "{k:?}");
+        }
+        for k in [
+            key(KeyCode::Right),
+            key(KeyCode::PageDown),
+            shift(KeyCode::Left),
+        ] {
+            let mut a = app();
+            a.focus = Focus::Brightness;
+            a.brightness = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(
+                a.message.as_deref(),
+                Some("brightness value unknown — press r to reload"),
+                "{k:?}"
+            );
+        }
+        let mut a = app();
+        a.focus = Focus::Brightness;
+        a.brightness_range = None;
+        assert!(a.handle_key(key(KeyCode::Right), now).is_empty());
+        assert_eq!(a.message.as_deref(), Some("brightness range unknown"));
+
+        for (focus, k) in [
+            (Focus::Exposure, key(KeyCode::Char('a'))),
+            (Focus::Mode, key(KeyCode::Right)),
+        ] {
+            let mut a = app();
+            a.focus = focus;
+            a.mode = None;
+            assert!(a.handle_key(k, now).is_empty(), "{k:?}");
+            assert_eq!(
+                a.message.as_deref(),
+                Some("mode unknown — press r to reload")
+            );
+        }
     }
 
     #[test]
