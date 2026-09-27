@@ -64,6 +64,9 @@ pub struct App {
     /// Digits typed in number entry, when open.
     pub entry: Option<String>,
     pub message: Option<String>,
+    /// Why the window could not be fitted at startup. Kept apart from `message`, which a camera
+    /// event clears; this one goes on the next key press.
+    pub window_problem: Option<String>,
     pub device: Option<String>,
     pub preview: Preview,
     pub quit: bool,
@@ -95,6 +98,7 @@ impl Default for App {
             mode: None,
             entry: None,
             message: None,
+            window_problem: None,
             device: None,
             preview: Preview::NoCamera,
             quit: false,
@@ -146,6 +150,7 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        self.window_problem = None;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.request_quit(now);
         }
@@ -745,6 +750,27 @@ mod tests {
                 "{from} {k:?}: {c:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_window_problem_survives_the_camera_and_goes_on_a_key() {
+        let mut a = App {
+            window_problem: Some("could not fit the window: xdotool not found".into()),
+            message: Some("old".into()),
+            ..App::default()
+        };
+        a.on_event(Event::Up {
+            generation: 1,
+            video_node: PathBuf::from("/dev/video0"),
+            ranges: Ranges {
+                exposure: Ok((1, 2500)),
+                brightness: Ok((0, 255)),
+            },
+        });
+        assert_eq!(a.message, None, "the camera clears the message");
+        assert!(a.window_problem.is_some(), "but not the window problem");
+        a.handle_key(key(KeyCode::Down), Instant::now());
+        assert_eq!(a.window_problem, None);
     }
 
     #[test]

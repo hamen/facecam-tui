@@ -238,6 +238,12 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             Style::default().fg(Color::Red),
         )));
     }
+    if let Some(problem) = &app.window_problem {
+        lines.push(Line::from(Span::styled(
+            problem.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines
 }
 

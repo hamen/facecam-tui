@@ -6,6 +6,7 @@ mod term;
 mod ui;
 mod usb;
 mod v4l2;
+mod window;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -111,6 +112,13 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
 
     let cell = picker.font_size();
     let mut app = App::default();
+    let _restore = match window::fit(kitty, picker.tmux_detected(), (cell.width, cell.height)) {
+        Ok(fitted) => window::Restore(fitted),
+        Err(problem) => {
+            app.window_problem = Some(problem);
+            window::Restore(None)
+        }
+    };
     let mut capture: Option<(PathBuf, Capture)> = None;
     let mut protocol: Option<StatefulProtocol> = None;
     let mut frames = FrameGate::default();
