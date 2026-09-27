@@ -166,12 +166,16 @@ impl App {
                 self.focus = self.focus.next();
                 Vec::new()
             }
-            KeyCode::BackTab => {
+            KeyCode::BackTab | KeyCode::Up => {
                 self.focus = self.focus.prev();
                 Vec::new()
             }
-            KeyCode::Left => self.step(if shift { -10 } else { -1 }, now),
-            KeyCode::Right => self.step(if shift { 10 } else { 1 }, now),
+            KeyCode::Down => {
+                self.focus = self.focus.next();
+                Vec::new()
+            }
+            KeyCode::Left => self.arrow(false, shift, now),
+            KeyCode::Right => self.arrow(true, shift, now),
             KeyCode::PageDown => self.step(-100, now),
             KeyCode::PageUp => self.step(100, now),
             // Exposure keys: on another control they would change a value that has no focus.
@@ -255,6 +259,18 @@ impl App {
         self.error(format!("exposure unavailable: {reason}"))
     }
 
+    /// `←` / `→`. Exposure jumps between flicker-free values (as `[` `]`), Shift steps by 10;
+    /// Brightness steps by 10, Shift by 1; Mode toggles.
+    fn arrow(&mut self, up: bool, shift: bool, now: Instant) -> Vec<Command> {
+        let sign = if up { 1 } else { -1 };
+        match (self.focus, shift) {
+            (Focus::Exposure, false) => self.snap(up, now),
+            (Focus::Exposure, true) | (Focus::Brightness, false) => self.step(10 * sign, now),
+            (Focus::Brightness, true) => self.step(sign, now),
+            (Focus::Mode, _) => self.toggle_mode(),
+        }
+    }
+
     fn step(&mut self, delta: i64, now: Instant) -> Vec<Command> {
         match self.focus {
             Focus::Exposure => {
@@ -276,8 +292,7 @@ impl App {
                 };
                 self.set_brightness((current + delta).clamp(min, max))
             }
-            // Only a single step toggles the mode; the larger steps do nothing here.
-            Focus::Mode if delta.abs() == 1 => self.toggle_mode(),
+            // The arrows toggle the mode (see `arrow`); PgUp / PgDn do nothing here.
             Focus::Mode => Vec::new(),
         }
     }
@@ -678,22 +693,86 @@ mod tests {
     #[test]
     fn step_sizes() {
         let t0 = Instant::now();
+        // Exposure: the arrows jump between flicker-free values, Shift steps by 10.
         let cases = [
-            (key(KeyCode::Right), 201),
-            (key(KeyCode::Left), 199),
-            (shift(KeyCode::Right), 210),
-            (shift(KeyCode::Left), 190),
-            (key(KeyCode::PageUp), 300),
-            (key(KeyCode::PageDown), 100),
+            (200, key(KeyCode::Right), 300),
+            (200, key(KeyCode::Left), 100),
+            (227, key(KeyCode::Right), 300),
+            (227, key(KeyCode::Left), 200),
+            (227, shift(KeyCode::Right), 237),
+            (200, shift(KeyCode::Right), 210),
+            (200, shift(KeyCode::Left), 190),
+            (200, key(KeyCode::PageUp), 300),
+            (200, key(KeyCode::PageDown), 100),
+        ];
+        for (from, k, want) in cases {
+            let mut a = app();
+            a.exposure = Some(from);
+            assert_eq!(
+                exposure_writes(&a.handle_key(k, t0)),
+                [want],
+                "{from} {k:?}"
+            );
+        }
+        // Brightness: the arrows step by 10, Shift by 1.
+        let cases = [
+            (key(KeyCode::Right), 50),
+            (key(KeyCode::Left), 30),
+            (shift(KeyCode::Right), 41),
+            (shift(KeyCode::Left), 39),
         ];
         for (k, want) in cases {
             let mut a = app();
-            assert_eq!(exposure_writes(&a.handle_key(k, t0)), [want], "{k:?}");
+            a.focus = Focus::Brightness;
+            let c = a.handle_key(k, t0);
+            assert!(
+                matches!(c[..], [Command::Brightness { value, .. }] if value == want),
+                "{k:?}: {c:?}"
+            );
         }
+    }
+
+    #[test]
+    fn brightness_arrows_clamp_to_the_range() {
+        let t0 = Instant::now();
+        for (from, k, want) in [(250, key(KeyCode::Right), 255), (5, key(KeyCode::Left), 0)] {
+            let mut a = app();
+            a.focus = Focus::Brightness;
+            a.brightness = Some(from);
+            let c = a.handle_key(k, t0);
+            assert!(
+                matches!(c[..], [Command::Brightness { value, .. }] if value == want),
+                "{from} {k:?}: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn up_and_down_cycle_focus() {
         let mut a = app();
-        a.focus = Focus::Brightness;
-        let c = a.handle_key(shift(KeyCode::Right), t0);
-        assert!(matches!(c[..], [Command::Brightness { value: 50, .. }]));
+        let now = Instant::now();
+        a.handle_key(key(KeyCode::Down), now);
+        assert_eq!(a.focus, Focus::Brightness);
+        a.handle_key(key(KeyCode::Down), now);
+        assert_eq!(a.focus, Focus::Mode);
+        a.handle_key(key(KeyCode::Down), now);
+        assert_eq!(a.focus, Focus::Exposure);
+        a.handle_key(key(KeyCode::Up), now);
+        assert_eq!(a.focus, Focus::Mode);
+    }
+
+    #[test]
+    fn exposure_arrows_share_the_snap_refusals() {
+        let now = Instant::now();
+        let mut a = app();
+        a.exposure = None;
+        assert!(a.handle_key(key(KeyCode::Left), now).is_empty());
+        assert_eq!(a.message.as_deref(), Some(EXPOSURE_UNKNOWN));
+        let mut a = app();
+        a.exposure_range = Ok((1, 50));
+        a.exposure = Some(20);
+        assert!(a.handle_key(key(KeyCode::Right), now).is_empty());
+        assert_eq!(a.message.as_deref(), Some("no flicker-free value in 1..50"));
     }
 
     #[test]
@@ -712,7 +791,7 @@ mod tests {
         assert!(matches!(
             c[..],
             [Command::Exposure {
-                value: 201,
+                value: 300,
                 ensure_shutter: true,
                 ..
             }]
@@ -725,18 +804,18 @@ mod tests {
         let mut a = app();
         let t0 = Instant::now();
         assert_eq!(
-            exposure_writes(&a.handle_key(key(KeyCode::Right), t0)),
-            [201]
+            exposure_writes(&a.handle_key(shift(KeyCode::Right), t0)),
+            [210]
         );
         let t1 = t0 + Duration::from_millis(10);
-        assert!(a.handle_key(key(KeyCode::Right), t1).is_empty());
-        assert!(a.handle_key(key(KeyCode::Right), t1).is_empty());
+        assert!(a.handle_key(shift(KeyCode::Right), t1).is_empty());
+        assert!(a.handle_key(shift(KeyCode::Right), t1).is_empty());
         assert!(a.tick(t0 + Duration::from_millis(20)).is_empty());
         assert_eq!(
             a.poll_timeout(t0 + Duration::from_millis(20)),
             Some(Duration::from_millis(10))
         );
-        assert_eq!(exposure_writes(&a.tick(t0 + THROTTLE)), [203]);
+        assert_eq!(exposure_writes(&a.tick(t0 + THROTTLE)), [230]);
         assert!(a.tick(t0 + THROTTLE * 3).is_empty(), "nothing left to send");
     }
 
@@ -744,21 +823,21 @@ mod tests {
     fn past_deadline_writes_now_and_timeout_saturates() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5));
         let late = t0 + Duration::from_millis(500);
         assert_eq!(a.poll_timeout(late), Some(Duration::ZERO));
-        assert_eq!(exposure_writes(&a.tick(late)), [202]);
+        assert_eq!(exposure_writes(&a.tick(late)), [220]);
     }
 
     #[test]
     fn quit_flushes_a_held_write() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5));
         let c = a.handle_key(key(KeyCode::Char('q')), t0 + Duration::from_millis(6));
-        assert_eq!(exposure_writes(&c), [202]);
+        assert_eq!(exposure_writes(&c), [220]);
         assert!(matches!(c.last(), Some(Command::Quit { .. })));
         assert!(a.quit);
     }
@@ -767,8 +846,8 @@ mod tests {
     fn switching_to_auto_cancels_a_held_write() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5));
         let c = a.handle_key(key(KeyCode::Char('a')), t0 + Duration::from_millis(6));
         assert!(matches!(
             c[..],
@@ -784,8 +863,8 @@ mod tests {
     fn r_cancels_held_writes_and_reads() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5));
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5));
         let c = a.handle_key(key(KeyCode::Char('r')), t0 + Duration::from_millis(6));
         assert!(matches!(c[..], [Command::ReadAll { .. }]));
         assert!(a.tick(t0 + THROTTLE * 2).is_empty());
@@ -857,12 +936,7 @@ mod tests {
         a.focus = Focus::Mode;
         assert!(a.handle_key(key(KeyCode::Enter), t).is_empty());
         assert_eq!(a.entry, None, "no number entry on Mode");
-        for k in [
-            key(KeyCode::PageUp),
-            key(KeyCode::PageDown),
-            shift(KeyCode::Left),
-            shift(KeyCode::Right),
-        ] {
+        for k in [key(KeyCode::PageUp), key(KeyCode::PageDown)] {
             assert!(a.handle_key(k, t).is_empty(), "{k:?}");
         }
         assert!(a.handle_key(key(KeyCode::Char('[')), t).is_empty());
@@ -872,6 +946,14 @@ mod tests {
             c[..],
             [Command::Mode {
                 mode: Mode::Auto,
+                ..
+            }]
+        ));
+        let c = a.handle_key(shift(KeyCode::Left), t);
+        assert!(matches!(
+            c[..],
+            [Command::Mode {
+                mode: Mode::Shutter,
                 ..
             }]
         ));
@@ -955,8 +1037,8 @@ mod tests {
     fn a_newer_write_sends_the_held_exposure_first() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5)); // held
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5)); // held
         a.handle_key(key(KeyCode::Tab), t0 + Duration::from_millis(6));
         let c = a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(7));
         let revs: Vec<u64> = c
@@ -969,7 +1051,7 @@ mod tests {
         assert!(matches!(
             c[..],
             [
-                Command::Exposure { value: 202, .. },
+                Command::Exposure { value: 220, .. },
                 Command::Brightness { .. }
             ]
         ));
@@ -981,14 +1063,14 @@ mod tests {
     fn switching_to_shutter_sends_the_held_exposure_first() {
         let mut a = app();
         let t0 = Instant::now();
-        a.handle_key(key(KeyCode::Right), t0);
-        a.handle_key(key(KeyCode::Right), t0 + Duration::from_millis(5)); // held
+        a.handle_key(shift(KeyCode::Right), t0);
+        a.handle_key(shift(KeyCode::Right), t0 + Duration::from_millis(5)); // held
         a.mode = Some(Mode::Auto); // a read-back flipped the shown mode
         let c = a.handle_key(key(KeyCode::Char('a')), t0 + Duration::from_millis(6));
         assert!(matches!(
             c[..],
             [
-                Command::Exposure { value: 202, .. },
+                Command::Exposure { value: 220, .. },
                 Command::Mode {
                     mode: Mode::Shutter,
                     ..
