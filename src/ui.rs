@@ -7,35 +7,52 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 
 use crate::{
     app::{App, BAR_MAX, FPS60_MAX, Focus, Preview},
     camera::Mode,
+    capture,
 };
 
 /// Wide terminals put the preview on the left.
-const WIDE: u16 = 120;
-const PANEL_WIDTH: u16 = 52;
+pub const WIDE: u16 = 120;
+pub const PANEL_WIDTH: u16 = 52;
 const PANEL_HEIGHT: u16 = 10;
 /// Half-block previews are capped: past this they only cost time.
 const HALFBLOCK_MAX: (u16, u16) = (96, 40);
 
+/// `cell` is the terminal's cell size in pixels (width, height).
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     preview: Option<&mut StatefulProtocol>,
     halfblocks: bool,
+    cell: (u16, u16),
 ) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let image = (capture::WIDTH, capture::HEIGHT);
+    // The preview pane hugs the image; the panel sits right next to it (wide) or below it.
     let (preview_area, panel_area) = if main.width >= WIDE {
-        let [p, c] =
+        let [p, _] =
             Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_WIDTH)]).areas(main);
+        let p = outer(preview_inner(inner(p), cell, image)).intersection(main);
+        let c = Rect {
+            x: p.right(),
+            width: PANEL_WIDTH.min(main.right().saturating_sub(p.right())),
+            ..main
+        };
         (p, c)
     } else {
-        let [p, c] =
+        let [p, _] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(PANEL_HEIGHT)]).areas(main);
+        let p = outer(preview_inner(inner(p), cell, image)).intersection(main);
+        let c = Rect {
+            y: p.bottom(),
+            height: PANEL_HEIGHT.min(main.bottom().saturating_sub(p.bottom())),
+            ..main
+        };
         (p, c)
     };
 
@@ -67,7 +84,14 @@ fn draw_preview(
             } else {
                 inner
             };
-            frame.render_stateful_widget(StatefulImage::default(), area, protocol);
+            // Scale, not the default Fit: Fit never enlarges, so a large pane showed a small
+            // image. The half-block path keeps Fit behind its cap.
+            let image = if halfblocks {
+                StatefulImage::default()
+            } else {
+                StatefulImage::default().resize(Resize::Scale(None))
+            };
+            frame.render_stateful_widget(image, area, protocol);
         }
         (_, state) => {
             let text = match state {
@@ -78,6 +102,44 @@ fn draw_preview(
             };
             frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
         }
+    }
+}
+
+/// The largest area inside `avail`, anchored top-left, whose size in pixels has the image's
+/// aspect ratio, to the nearest whole cell.
+pub fn preview_inner(avail: Rect, (cw, ch): (u16, u16), (iw, ih): (u32, u32)) -> Rect {
+    if cw == 0 || ch == 0 || iw == 0 || ih == 0 {
+        return avail;
+    }
+    let (cw, ch) = (u64::from(cw), u64::from(ch));
+    let (iw, ih) = (u64::from(iw), u64::from(ih));
+    let (w, h) = (u64::from(avail.width), u64::from(avail.height));
+    // Full height: how many columns keep the aspect?
+    let cols = (h * ch * iw + ih * cw / 2) / (ih * cw);
+    let (cols, rows) = if cols <= w {
+        (cols, h)
+    } else {
+        (w, ((w * cw * ih + iw * ch / 2) / (iw * ch)).min(h))
+    };
+    Rect {
+        width: cols as u16,
+        height: rows as u16,
+        ..avail
+    }
+}
+
+/// The area inside a one-cell border.
+fn inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+/// The area with a one-cell border around `inner`.
+fn outer(inner: Rect) -> Rect {
+    Rect {
+        x: inner.x.saturating_sub(1),
+        y: inner.y.saturating_sub(1),
+        width: inner.width + 2,
+        height: inner.height + 2,
     }
 }
 
@@ -268,6 +330,59 @@ mod tests {
         assert_eq!(b.chars().filter(|c| *c == '┃').count(), 3);
         let covered = bar(333, 1, 333, 30, &[100, 200, 300]);
         assert_eq!(covered.chars().filter(|c| *c == '┃').count(), 0);
+    }
+
+    const CELL: (u16, u16) = (12, 27);
+    const IMAGE: (u32, u32) = (960, 540);
+
+    #[test]
+    fn the_preview_hugs_the_image() {
+        let at = |w, h| Rect::new(3, 4, w, h);
+        // Height-limited: 40 rows of 27 px hold 1080 px, so 1920 px = 160 columns.
+        assert_eq!(preview_inner(at(200, 40), CELL, IMAGE), at(160, 40));
+        // Width-limited: 80 columns of 12 px hold 960 px, so 540 px = 20 rows.
+        assert_eq!(preview_inner(at(80, 40), CELL, IMAGE), at(80, 20));
+        assert_eq!(preview_inner(at(0, 0), CELL, IMAGE), at(0, 0));
+    }
+
+    #[test]
+    fn the_preview_keeps_the_aspect_within_a_cell() {
+        let (cw, ch) = (u64::from(CELL.0), u64::from(CELL.1));
+        let (iw, ih) = (u64::from(IMAGE.0), u64::from(IMAGE.1));
+        for w in 1..=200 {
+            for h in 1..=60 {
+                let avail = Rect::new(0, 0, w, h);
+                let r = preview_inner(avail, CELL, IMAGE);
+                assert!(r.width <= w && r.height <= h, "{avail:?} -> {r:?}");
+                assert!(r.width == w || r.height == h, "uses one full side: {r:?}");
+                let (cols, rows) = (u64::from(r.width), u64::from(r.height));
+                let skew = (cols * cw * ih).abs_diff(rows * ch * iw);
+                assert!(skew <= (ih * cw).max(iw * ch), "{avail:?} -> {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_panel_sits_next_to_the_preview_at_any_size() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let app = App::default();
+        for w in (10..=220).step_by(7) {
+            for h in (4..=70).step_by(3) {
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| draw(f, &app, None, false, CELL)).unwrap();
+                if w < WIDE || h < 12 {
+                    continue;
+                }
+                let buffer = t.backend().buffer();
+                let row: String = (0..w).map(|x| buffer[(x, 0)].symbol()).collect();
+                let preview_end = row.find('┐').expect("preview corner");
+                let rest = &row[preview_end + '┐'.len_utf8()..];
+                assert!(
+                    rest.starts_with('┌'),
+                    "{w}x{h}: panel starts right after: {row}"
+                );
+            }
+        }
     }
 
     #[test]

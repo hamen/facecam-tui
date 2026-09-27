@@ -109,6 +109,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
             .spawn(move || control::run(shared, events_tx, sysfs, dev))?;
     }
 
+    let cell = picker.font_size();
     let mut app = App::default();
     let mut capture: Option<(PathBuf, Capture)> = None;
     let mut protocol: Option<StatefulProtocol> = None;
@@ -161,6 +162,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
                 &app,
                 protocol.as_mut(),
                 !kitty && picker.protocol_type() == ProtocolType::Halfblocks,
+                (cell.width, cell.height),
             )
         })?;
 
