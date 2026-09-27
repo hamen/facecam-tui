@@ -983,6 +983,14 @@ mod tests {
                 ..
             }]
         ));
+        let c = a.handle_key(key(KeyCode::Left), t);
+        assert!(matches!(
+            c[..],
+            [Command::Mode {
+                mode: Mode::Auto,
+                ..
+            }]
+        ));
     }
 
     #[test]

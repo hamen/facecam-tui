@@ -15,10 +15,10 @@ use crate::{
 };
 
 /// How long to wait for the window manager to apply the resize before reading the size back.
-const SETTLE: Duration = Duration::from_millis(1000);
+pub const SETTLE: Duration = Duration::from_millis(1000);
 
 /// A window this process resized.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Fitted {
     window_id: String,
     original: (u32, u32),
@@ -26,88 +26,142 @@ pub struct Fitted {
     fitted: (u32, u32),
 }
 
-/// Fits the window when this is kitty itself on X11, outside tmux, and the window is neither
-/// maximized nor fullscreen. `Ok(None)`: nothing to do. `Err`: a message for the panel.
-pub fn fit(protocol_kitty: bool, tmux: bool, cell: (u16, u16)) -> Result<Option<Fitted>, String> {
-    let env = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
-    // The kitty graphics protocol is also spoken by other terminals; only kitty sets this.
-    let kitty = protocol_kitty && env("KITTY_WINDOW_ID").is_some();
-    let window_id = env("WINDOWID");
-    let display = env("DISPLAY");
-    if !kitty || tmux || window_id.is_none() || display.is_none() {
-        return Ok(None);
+/// What decides whether this is a window to fit.
+#[derive(Debug, Default)]
+pub struct Env {
+    /// The terminal speaks the kitty graphics protocol (WezTerm and Ghostty do too).
+    pub protocol_kitty: bool,
+    /// `$KITTY_WINDOW_ID` is set: only kitty itself sets it.
+    pub kitty_window_id: bool,
+    pub tmux: bool,
+    /// `$WINDOWID`.
+    pub window_id: Option<String>,
+    /// `$DISPLAY` is set.
+    pub display: bool,
+}
+
+impl Env {
+    pub fn from_process(protocol_kitty: bool, tmux: bool) -> Self {
+        let var = |name| std::env::var(name).ok().filter(|v: &String| !v.is_empty());
+        Self {
+            protocol_kitty,
+            kitty_window_id: var("KITTY_WINDOW_ID").is_some(),
+            tmux,
+            window_id: var("WINDOWID"),
+            display: var("DISPLAY").is_some(),
+        }
     }
+
+    /// The window to fit, when this is kitty itself on X11 outside tmux.
+    fn window(&self) -> Option<&str> {
+        let kitty = self.protocol_kitty && self.kitty_window_id;
+        (kitty && !self.tmux && self.display)
+            .then_some(self.window_id.as_deref())
+            .flatten()
+            .filter(|w| !w.is_empty())
+    }
+}
+
+/// The X11 calls, behind a trait so the fit and the restore can run against a fake.
+pub trait X11 {
+    /// `xprop`'s `_NET_WM_STATE` line.
+    fn wm_state(&mut self, window: &str) -> Result<String, String>;
+    fn geometry(&mut self, window: &str) -> Result<(u32, u32), String>;
+    fn resize(&mut self, window: &str, size: (u32, u32)) -> Result<(), String>;
+}
+
+/// `xprop` and `xdotool`.
+pub struct Xdotool;
+
+impl X11 for Xdotool {
+    fn wm_state(&mut self, window: &str) -> Result<String, String> {
+        run("xprop", &["-id", window, "_NET_WM_STATE"])
+    }
+
+    fn geometry(&mut self, window: &str) -> Result<(u32, u32), String> {
+        let text = run("xdotool", &["getwindowgeometry", "--shell", window])?;
+        parse_geometry(&text).ok_or_else(|| format!("unexpected xdotool output: {text:?}"))
+    }
+
+    fn resize(&mut self, window: &str, (w, h): (u32, u32)) -> Result<(), String> {
+        run(
+            "xdotool",
+            &["windowsize", window, &w.to_string(), &h.to_string()],
+        )
+        .map(|_| ())
+    }
+}
+
+/// Fits the window when `env` says it is kitty itself on X11 outside tmux, and the window is
+/// neither maximized nor fullscreen. `grid` is the terminal size in cells. `Ok(None)`: nothing to
+/// do. `Err`: a message for the panel, and the window was not resized.
+pub fn fit(
+    env: &Env,
+    x: &mut impl X11,
+    grid: (u16, u16),
+    cell: (u16, u16),
+    settle: Duration,
+) -> Result<Option<Fitted>, String> {
+    let Some(window) = env.window() else {
+        return Ok(None);
+    };
     let problem = |e: String| format!("could not fit the window: {e}");
-    let window_id = window_id.unwrap_or_default();
-    let state = run("xprop", &["-id", &window_id, "_NET_WM_STATE"]).map_err(problem)?;
-    if !should_fit(
-        kitty,
-        tmux,
-        Some(&window_id),
-        display.as_deref(),
-        Some(&state),
-    ) {
+    // An unknown state is not fitted: resizing a maximized window fights the window manager.
+    let state = x.wm_state(window).map_err(problem)?;
+    if !normal_state(&state) {
         return Ok(None);
     }
-    let original = geometry(&window_id).map_err(problem)?;
-    let grid = crossterm::terminal::size().map_err(|e| problem(e.to_string()))?;
+    let original = x.geometry(window).map_err(problem)?;
     let target = target_pixels(original, grid, cell, want_grid(cell));
     if target == original {
         return Ok(None);
     }
-    let (w, h) = (target.0.to_string(), target.1.to_string());
-    run("xdotool", &["windowsize", &window_id, &w, &h]).map_err(problem)?;
-    // Not `windowsize --sync`: it waits for the size to change, forever if the window manager
-    // keeps the old size.
-    let end = Instant::now() + SETTLE;
-    let mut fitted = geometry(&window_id).map_err(problem)?;
-    while fitted == original && Instant::now() < end {
-        thread::sleep(Duration::from_millis(50));
-        fitted = geometry(&window_id).map_err(problem)?;
-    }
+    x.resize(window, target).map_err(problem)?;
+    // From here the window may have changed size, so a `Fitted` always comes back: the restore
+    // must still run. Not `windowsize --sync`: it waits for the size to change, forever if the
+    // window manager keeps the old size. When the size cannot be read back, the requested size
+    // stands in for it.
+    let end = Instant::now() + settle;
+    let fitted = loop {
+        match x.geometry(window) {
+            Ok(size) if size != original || Instant::now() >= end => break size,
+            Ok(_) => thread::sleep(Duration::from_millis(50)),
+            Err(_) => break target,
+        }
+    };
     Ok(Some(Fitted {
-        window_id,
+        window_id: window.to_string(),
         original,
         fitted,
     }))
 }
 
-/// Gives the window its original size back when dropped, if it still has the fitted size: a size
-/// the user set by hand in the meantime is kept. It lives in `run`, so it drops on a normal quit,
-/// on an error returned with `?`, and during the unwind after a panic.
+/// Gives the window its original size back when dropped (see [`restore`]). It lives in `run`, so
+/// it drops on a normal quit, on an error returned with `?`, and during the unwind after a panic.
 pub struct Restore(pub Option<Fitted>);
 
 impl Drop for Restore {
     fn drop(&mut self) {
-        let Some(f) = &self.0 else {
-            return;
-        };
-        // Errors are ignored: the terminal is already gone, there is nobody to tell.
-        if geometry(&f.window_id).is_ok_and(|now| should_restore(now, f.fitted)) {
-            let (w, h) = (f.original.0.to_string(), f.original.1.to_string());
-            let _ = run("xdotool", &["windowsize", &f.window_id, &w, &h]);
+        if let Some(f) = &self.0 {
+            restore(f, &mut Xdotool);
         }
     }
 }
 
-/// The precondition for a fit. `wm_state` is `xprop`'s `_NET_WM_STATE` line; `None` means it is
-/// unknown, and an unknown state is not fitted.
-pub fn should_fit(
-    kitty: bool,
-    tmux: bool,
-    window_id: Option<&str>,
-    display: Option<&str>,
-    wm_state: Option<&str>,
-) -> bool {
-    let Some(state) = wm_state else {
-        return false;
-    };
-    kitty
-        && !tmux
-        && window_id.is_some_and(|w| !w.is_empty())
-        && display.is_some_and(|d| !d.is_empty())
-        && !state.contains("_NET_WM_STATE_MAXIMIZED")
-        && !state.contains("_NET_WM_STATE_FULLSCREEN")
+/// Resizes the window back to its original size if it still has the fitted size: a size the user
+/// set by hand in the meantime is kept. Errors are ignored: the terminal is already gone, there is
+/// nobody to tell.
+pub fn restore(f: &Fitted, x: &mut impl X11) {
+    if x.geometry(&f.window_id)
+        .is_ok_and(|now| should_restore(now, f.fitted))
+    {
+        let _ = x.resize(&f.window_id, f.original);
+    }
+}
+
+/// `xprop`'s `_NET_WM_STATE` line for a window that is neither maximized nor fullscreen.
+fn normal_state(state: &str) -> bool {
+    !state.contains("_NET_WM_STATE_MAXIMIZED") && !state.contains("_NET_WM_STATE_FULLSCREEN")
 }
 
 pub fn should_restore(current: (u32, u32), fitted: (u32, u32)) -> bool {
@@ -149,11 +203,6 @@ pub fn parse_geometry(text: &str) -> Option<(u32, u32)> {
     Some((value("WIDTH")?, value("HEIGHT")?))
 }
 
-fn geometry(window_id: &str) -> Result<(u32, u32), String> {
-    let text = run("xdotool", &["getwindowgeometry", "--shell", window_id])?;
-    parse_geometry(&text).ok_or_else(|| format!("unexpected xdotool output: {text:?}"))
-}
-
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new(program).args(args).output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -189,29 +238,188 @@ mod tests {
         assert_eq!(want_grid((30, 60)).0, WIDE);
     }
 
+    /// Records every call, in order, and answers from a script.
+    #[derive(Default)]
+    struct Fake {
+        calls: Vec<String>,
+        state: Option<String>,
+        /// Answers to successive geometry reads; past the end, the last one repeats.
+        sizes: Vec<Result<(u32, u32), String>>,
+        resize_fails: bool,
+    }
+
+    impl X11 for Fake {
+        fn wm_state(&mut self, window: &str) -> Result<String, String> {
+            self.calls.push(format!("state {window}"));
+            self.state
+                .clone()
+                .ok_or_else(|| "xprop not found".to_string())
+        }
+
+        fn geometry(&mut self, window: &str) -> Result<(u32, u32), String> {
+            self.calls.push(format!("geometry {window}"));
+            if self.sizes.len() > 1 {
+                self.sizes.remove(0)
+            } else {
+                self.sizes[0].clone()
+            }
+        }
+
+        fn resize(&mut self, window: &str, (w, h): (u32, u32)) -> Result<(), String> {
+            self.calls.push(format!("resize {window} {w}x{h}"));
+            if self.resize_fails {
+                return Err("xdotool failed".into());
+            }
+            Ok(())
+        }
+    }
+
+    const NORMAL: &str = "_NET_WM_STATE(ATOM) = _NET_WM_STATE_FOCUSED";
+    const ORIGINAL: (u32, u32) = (1961, 1249);
+    const TARGET: (u32, u32) = (1649, 655);
+
+    fn kitty() -> Env {
+        Env {
+            protocol_kitty: true,
+            kitty_window_id: true,
+            tmux: false,
+            window_id: Some("42".into()),
+            display: true,
+        }
+    }
+
+    fn fake(sizes: Vec<Result<(u32, u32), String>>) -> Fake {
+        Fake {
+            state: Some(NORMAL.into()),
+            sizes,
+            ..Fake::default()
+        }
+    }
+
+    fn fit_now(env: &Env, x: &mut Fake) -> Result<Option<Fitted>, String> {
+        fit(env, x, (160, 45), (12, 27), Duration::ZERO)
+    }
+
     #[test]
-    fn fits_only_kitty_itself_outside_tmux_and_not_maximized() {
-        let normal = Some("_NET_WM_STATE(ATOM) = _NET_WM_STATE_FOCUSED");
-        let absent = Some("_NET_WM_STATE:  not found.");
-        let id = Some("130023435");
-        let d = Some(":0");
-        assert!(should_fit(true, false, id, d, normal));
-        assert!(should_fit(true, false, id, d, absent));
-        assert!(!should_fit(false, false, id, d, normal), "not kitty");
-        assert!(!should_fit(true, true, id, d, normal), "tmux");
-        assert!(!should_fit(true, false, None, d, normal), "no WINDOWID");
-        assert!(
-            !should_fit(true, false, Some(""), d, normal),
-            "empty WINDOWID"
+    fn fits_kitty_and_measures_the_new_size() {
+        let mut x = fake(vec![Ok(ORIGINAL), Ok((1650, 656))]);
+        let fitted = fit_now(&kitty(), &mut x).unwrap().unwrap();
+        assert_eq!(
+            x.calls,
+            [
+                "state 42",
+                "geometry 42",
+                "resize 42 1649x655",
+                "geometry 42"
+            ]
         );
-        assert!(!should_fit(true, false, id, None, normal), "no DISPLAY");
-        assert!(!should_fit(true, false, id, d, None), "state unknown");
-        let max = Some(
+        assert_eq!(fitted.original, ORIGINAL);
+        assert_eq!(
+            fitted.fitted,
+            (1650, 656),
+            "the size read back, not the target"
+        );
+    }
+
+    #[test]
+    fn a_failed_read_back_still_returns_a_fitted_window() {
+        let mut x = fake(vec![Ok(ORIGINAL), Err("xdotool failed".into())]);
+        let fitted = fit_now(&kitty(), &mut x).unwrap().unwrap();
+        assert_eq!(fitted.fitted, TARGET, "the requested size stands in");
+        assert_eq!(fitted.original, ORIGINAL);
+    }
+
+    #[test]
+    fn leaves_other_terminals_tmux_and_missing_env_alone() {
+        let cases = [
+            Env {
+                kitty_window_id: false,
+                ..kitty()
+            },
+            Env {
+                protocol_kitty: false,
+                ..kitty()
+            },
+            Env {
+                tmux: true,
+                ..kitty()
+            },
+            Env {
+                window_id: None,
+                ..kitty()
+            },
+            Env {
+                window_id: Some(String::new()),
+                ..kitty()
+            },
+            Env {
+                display: false,
+                ..kitty()
+            },
+        ];
+        for env in cases {
+            let mut x = fake(vec![Ok(ORIGINAL)]);
+            assert_eq!(fit_now(&env, &mut x), Ok(None), "{env:?}");
+            assert!(x.calls.is_empty(), "{env:?}: {:?}", x.calls);
+        }
+    }
+
+    #[test]
+    fn leaves_a_maximized_or_fullscreen_window_alone() {
+        for state in [
             "_NET_WM_STATE(ATOM) = _NET_WM_STATE_MAXIMIZED_VERT, _NET_WM_STATE_MAXIMIZED_HORZ",
+            "_NET_WM_STATE(ATOM) = _NET_WM_STATE_FULLSCREEN",
+        ] {
+            let mut x = Fake {
+                state: Some(state.into()),
+                ..fake(vec![Ok(ORIGINAL)])
+            };
+            assert_eq!(fit_now(&kitty(), &mut x), Ok(None), "{state}");
+            assert_eq!(x.calls, ["state 42"]);
+        }
+        let mut x = fake(vec![Ok(ORIGINAL)]);
+        x.state = Some("_NET_WM_STATE:  not found.".into());
+        assert!(
+            fit_now(&kitty(), &mut x).unwrap().is_some(),
+            "no state is normal"
         );
-        assert!(!should_fit(true, false, id, d, max), "maximized");
-        let full = Some("_NET_WM_STATE(ATOM) = _NET_WM_STATE_FULLSCREEN");
-        assert!(!should_fit(true, false, id, d, full), "fullscreen");
+    }
+
+    #[test]
+    fn an_unknown_state_or_a_failed_resize_is_a_problem_without_a_fit() {
+        let mut x = Fake {
+            state: None,
+            ..fake(vec![Ok(ORIGINAL)])
+        };
+        let err = fit_now(&kitty(), &mut x).unwrap_err();
+        assert_eq!(err, "could not fit the window: xprop not found");
+        assert_eq!(x.calls, ["state 42"], "no resize");
+
+        let mut x = Fake {
+            resize_fails: true,
+            ..fake(vec![Ok(ORIGINAL)])
+        };
+        assert!(fit_now(&kitty(), &mut x).is_err());
+    }
+
+    #[test]
+    fn restore_resizes_back_only_an_unchanged_window() {
+        let f = Fitted {
+            window_id: "42".into(),
+            original: ORIGINAL,
+            fitted: TARGET,
+        };
+        let mut x = fake(vec![Ok(TARGET)]);
+        restore(&f, &mut x);
+        assert_eq!(x.calls, ["geometry 42", "resize 42 1961x1249"]);
+
+        let mut x = fake(vec![Ok((1920, 1080))]);
+        restore(&f, &mut x);
+        assert_eq!(x.calls, ["geometry 42"], "resized by hand: kept");
+
+        let mut x = fake(vec![Err("gone".into())]);
+        restore(&f, &mut x);
+        assert_eq!(x.calls, ["geometry 42"], "unreadable: left alone");
     }
 
     #[test]

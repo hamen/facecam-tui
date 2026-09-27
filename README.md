@@ -47,7 +47,8 @@ only multiples of 100 are flicker-free; the panel says so for any other value.
 In kitty on X11 the window is fitted at start to the preview (the 960x540 image at its native
 size) and the panel, and given its size back on quit if you have not resized it yourself. It needs
 `xdotool` and `xprop`; a maximized or fullscreen window, tmux, and other terminals are left alone.
-The preview always hugs the image and scales it to the pane.
+With the kitty graphics protocol the preview hugs the image and scales it to the pane; the
+half-block fallback keeps its smaller, capped size.
 
 ## Development
 

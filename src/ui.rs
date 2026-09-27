@@ -226,6 +226,13 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     };
     lines.push(row(app, Focus::Mode, "Mode      ", mode, ""));
     lines.push(Line::default());
+    // Before the entry and the message, so a short panel does not push it off the bottom.
+    if let Some(problem) = &app.window_problem {
+        lines.push(Line::from(Span::styled(
+            problem.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
 
     if let Some(entry) = &app.entry {
         lines.push(Line::from(Span::styled(
@@ -236,12 +243,6 @@ fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled(
             message.clone(),
             Style::default().fg(Color::Red),
-        )));
-    }
-    if let Some(problem) = &app.window_problem {
-        lines.push(Line::from(Span::styled(
-            problem.clone(),
-            Style::default().fg(Color::Yellow),
         )));
     }
     lines
