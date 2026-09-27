@@ -97,7 +97,18 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let bar_width = inner.width.saturating_sub(24).max(8) as usize;
+    frame.render_widget(
+        Paragraph::new(panel_lines(app, inner.width)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// The panel's text. The control rows and notes fit `width`; the entry and message lines may be
+/// longer (error text of any length) and wrap.
+fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    // A row is the marker and label (13 columns), the bar, and the value text with its leading
+    // space: 15 columns for the longest, `2500  250.0 ms`.
+    let bar_width = width.saturating_sub(28).max(8) as usize;
 
     let mut lines = Vec::new();
     let exposure_text = match app.exposure {
@@ -125,7 +136,12 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     ));
     let note = app.exposure.and_then(exposure_note).unwrap_or("");
     lines.push(Line::from(Span::styled(
-        format!("          {note}"),
+        format!("  {note}"),
+        Style::default().fg(Color::Yellow),
+    )));
+    let flicker = app.exposure.and_then(flicker_note).unwrap_or("");
+    lines.push(Line::from(Span::styled(
+        format!("  {flicker}"),
         Style::default().fg(Color::Yellow),
     )));
 
@@ -160,10 +176,10 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines
 }
 
-fn row<'a>(app: &App, focus: Focus, label: &'a str, body: &str, value: &str) -> Line<'a> {
+fn row(app: &App, focus: Focus, label: &'static str, body: &str, value: &str) -> Line<'static> {
     let focused = app.focus == focus;
     let marker = if focused { "▶ " } else { "  " };
     let style = if focused {
@@ -215,6 +231,11 @@ pub fn bar(value: i64, lo: i64, hi: i64, width: usize, marks: &[i64]) -> String 
 }
 
 /// The frame-rate warning for an exposure value (units of 100 µs).
+/// Under 50 Hz light only multiples of 10 ms (100 units) stay flicker-free.
+pub fn flicker_note(value: u32) -> Option<&'static str> {
+    (!value.is_multiple_of(100)).then_some("flickers under 50 Hz light")
+}
+
 pub fn exposure_note(value: u32) -> Option<&'static str> {
     if value > BAR_MAX {
         Some("above 333: 30 fps drops too")
@@ -247,6 +268,44 @@ mod tests {
         assert_eq!(b.chars().filter(|c| *c == '┃').count(), 3);
         let covered = bar(333, 1, 333, 30, &[100, 200, 300]);
         assert_eq!(covered.chars().filter(|c| *c == '┃').count(), 0);
+    }
+
+    #[test]
+    fn flicker_notes() {
+        assert_eq!(flicker_note(100), None);
+        assert_eq!(flicker_note(200), None);
+        assert_eq!(flicker_note(227), Some("flickers under 50 Hz light"));
+        assert_eq!(flicker_note(1), Some("flickers under 50 Hz light"));
+    }
+
+    /// The control rows and notes (everything above the blank line) stay on one row each at the
+    /// default panel width; only the entry and message lines may wrap.
+    #[test]
+    fn panel_rows_fit_the_default_panel() {
+        let width = PANEL_WIDTH - 2;
+        for exposure in [1, 200, 227, 2500] {
+            for brightness in [0, 255] {
+                for focus in [Focus::Exposure, Focus::Brightness, Focus::Mode] {
+                    let mut app = App::default();
+                    app.focus = focus;
+                    app.exposure = Some(exposure);
+                    app.exposure_range = Ok((1, 2500));
+                    app.brightness = Some(brightness);
+                    app.brightness_range = Some((0, 255));
+                    app.mode = Some(Mode::Shutter);
+                    let lines = panel_lines(&app, width);
+                    let fixed: Vec<_> = lines.iter().take_while(|l| l.width() > 0).collect();
+                    assert_eq!(fixed.len(), 5, "exposure, two notes, brightness, mode");
+                    for line in fixed {
+                        assert!(
+                            line.width() <= usize::from(width),
+                            "{exposure}/{brightness}: {} > {width}: {line}",
+                            line.width()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
