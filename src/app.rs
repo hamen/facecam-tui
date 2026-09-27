@@ -266,10 +266,10 @@ impl App {
 
     /// `←` / `→`. Exposure jumps between flicker-free values (as `[` `]`), Shift steps by 10;
     /// Brightness steps by 10, Shift by 1; Mode toggles.
-    fn arrow(&mut self, up: bool, shift: bool, now: Instant) -> Vec<Command> {
-        let sign = if up { 1 } else { -1 };
+    fn arrow(&mut self, increase: bool, shift: bool, now: Instant) -> Vec<Command> {
+        let sign = if increase { 1 } else { -1 };
         match (self.focus, shift) {
-            (Focus::Exposure, false) => self.snap(up, now),
+            (Focus::Exposure, false) => self.snap(increase, now),
             (Focus::Exposure, true) | (Focus::Brightness, false) => self.step(10 * sign, now),
             (Focus::Brightness, true) => self.step(sign, now),
             (Focus::Mode, _) => self.toggle_mode(),

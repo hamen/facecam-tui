@@ -299,12 +299,12 @@ pub fn bar(value: i64, lo: i64, hi: i64, width: usize, marks: &[i64]) -> String 
         .collect()
 }
 
-/// The frame-rate warning for an exposure value (units of 100 µs).
 /// Under 50 Hz light only multiples of 10 ms (100 units) stay flicker-free.
 pub fn flicker_note(value: u32) -> Option<&'static str> {
     (!value.is_multiple_of(100)).then_some("flickers under 50 Hz light")
 }
 
+/// The frame-rate warning for an exposure value (units of 100 µs).
 pub fn exposure_note(value: u32) -> Option<&'static str> {
     if value > BAR_MAX {
         Some("above 333: 30 fps drops too")
