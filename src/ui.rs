@@ -271,8 +271,8 @@ fn help(app: &App) -> String {
     if app.entry.is_some() {
         return "digits · Backspace · Enter apply · Esc cancel · Ctrl+C quit".into();
     }
-    "Tab focus · ←/→ ±1 · Shift ±10 · PgUp/PgDn ±100 · [ ] ±flicker-free (Exposure; below 100: up to 100) \
-     · a auto · Enter type · r reload · q quit"
+    "↑↓ select · ←→ step · Shift fine · PgUp/PgDn ±100 · [ ] flicker-free · a auto · Enter type \
+     · r reload · q quit"
         .into()
 }
 
@@ -389,6 +389,12 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_help_line_fits_a_wide_terminal() {
+        let width = Line::from(help(&App::default())).width();
+        assert!(width <= usize::from(WIDE), "{width} > {WIDE}");
     }
 
     #[test]

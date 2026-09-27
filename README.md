@@ -28,9 +28,9 @@ Deck rules ship one). Without it, exposure is disabled and brightness and mode s
 
 | Key | Action |
 | --- | --- |
-| `Tab` / `Shift+Tab` | next / previous control (Exposure → Brightness → Mode) |
-| `←` `→` | −1 / +1 (on Mode: toggle) |
-| `Shift+←` `Shift+→` | −10 / +10 |
+| `↓` `↑` or `Tab` / `Shift+Tab` | next / previous control (Exposure → Brightness → Mode) |
+| `←` `→` | Exposure: previous / next flicker-free value (as `[` `]`) · Brightness: −10 / +10 · Mode: toggle |
+| `Shift+←` `Shift+→` | Exposure: −10 / +10 · Brightness: −1 / +1 · Mode: toggle |
 | `PgDn` `PgUp` | −100 / +100 |
 | `[` `]` | Exposure only: previous / next multiple of 100 — flicker-free under 50 Hz light (below 100, `[` goes up to 100) |
 | `a` | toggle Auto / Shutter Priority |
@@ -39,7 +39,15 @@ Deck rules ship one). Without it, exposure is disabled and brightness and mode s
 | `q` / `Esc` / `Ctrl+C` | quit |
 
 Exposure is in units of 100 µs: 200 = 20 ms. Changing it switches the camera to Shutter Priority.
-Above 166, apps that capture at 60 fps drop frames; above 333, 30 fps drops too.
+Above 166, apps that capture at 60 fps drop frames; above 333, 30 fps drops too. Under 50 Hz light
+only multiples of 100 are flicker-free; the panel says so for any other value.
+
+## Window
+
+In kitty on X11 the window is fitted at start to the preview (the 960x540 image at its native
+size) and the panel, and given its size back on quit if you have not resized it yourself. It needs
+`xdotool` and `xprop`; a maximized or fullscreen window, tmux, and other terminals are left alone.
+The preview always hugs the image and scales it to the pane.
 
 ## Development
 
