@@ -66,8 +66,9 @@ pub fn restore(out: &mut impl Write, kitty: bool) -> io::Result<()> {
     } else {
         Ok(())
     };
-    let left = execute!(out, LeaveAlternateScreen, Show);
-    ended.and(deleted).and(left).and(out.flush())
+    let left = execute!(out, LeaveAlternateScreen);
+    let shown = execute!(out, Show);
+    ended.and(deleted).and(left).and(shown).and(out.flush())
 }
 
 fn install_panic_hook(kitty: bool) {
@@ -110,6 +111,8 @@ mod tests {
         BeginFlush,
         /// The End write.
         End,
+        /// The leave-alternate-screen write.
+        Leave,
     }
 
     /// Records everything written to it, and fails the step named by `fail`.
@@ -142,6 +145,9 @@ mod tests {
             }
             if self.fail == Fail::End && end {
                 return Err(io::Error::other("end write failed"));
+            }
+            if self.fail == Fail::Leave && buf == b"\x1b[?1049l" {
+                return Err(io::Error::other("leave write failed"));
             }
             self.after_begin.set(begin);
             self.out.borrow_mut().extend_from_slice(buf);
@@ -226,6 +232,15 @@ mod tests {
             "leave alternate screen: {text:?}"
         );
         assert!(text.contains("\x1b[?25h"), "show cursor: {text:?}");
+    }
+
+    #[test]
+    fn restore_shows_the_cursor_when_leaving_the_alternate_screen_fails() {
+        let mut recorder = Recorder::failing(Fail::Leave);
+        let err = restore(&mut recorder, false).unwrap_err();
+        assert_eq!(err.to_string(), "leave write failed");
+        let text = recorder.text();
+        assert!(text.ends_with("\x1b[?25h"), "show cursor: {text:?}");
     }
 
     #[test]
