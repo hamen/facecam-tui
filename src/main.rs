@@ -113,12 +113,16 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
     let cell = picker.font_size();
     let mut app = App::default();
     let env = window::Env::from_process(kitty, picker.tmux_detected());
-    let fitted = crossterm::terminal::size()
-        .map_err(|e| format!("could not fit the window: {e}"))
-        .and_then(|grid| {
-            let cell = (cell.width, cell.height);
-            window::fit(&env, &mut window::Xdotool, grid, cell, window::SETTLE)
-        });
+    // The size is read only for a window to fit: elsewhere its failure is no fit problem.
+    let fitted = match env.window() {
+        None => Ok(None),
+        Some(_) => crossterm::terminal::size()
+            .map_err(|e| format!("could not fit the window: {e}"))
+            .and_then(|grid| {
+                let cell = (cell.width, cell.height);
+                window::fit(&env, &mut window::Xdotool, grid, cell, window::SETTLE)
+            }),
+    };
     let _restore = match fitted {
         Ok(fitted) => window::Restore(fitted),
         Err(problem) => {

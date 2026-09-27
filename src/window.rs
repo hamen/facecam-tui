@@ -16,6 +16,7 @@ use crate::{
 
 /// How long to wait for the window manager to apply the resize before reading the size back.
 pub const SETTLE: Duration = Duration::from_millis(1000);
+const POLL: Duration = Duration::from_millis(50);
 
 /// A window this process resized.
 #[derive(Debug, PartialEq)]
@@ -53,7 +54,7 @@ impl Env {
     }
 
     /// The window to fit, when this is kitty itself on X11 outside tmux.
-    fn window(&self) -> Option<&str> {
+    pub fn window(&self) -> Option<&str> {
         let kitty = self.protocol_kitty && self.kitty_window_id;
         (kitty && !self.tmux && self.display)
             .then_some(self.window_id.as_deref())
@@ -119,15 +120,22 @@ pub fn fit(
     x.resize(window, target).map_err(problem)?;
     // From here the window may have changed size, so a `Fitted` always comes back: the restore
     // must still run. Not `windowsize --sync`: it waits for the size to change, forever if the
-    // window manager keeps the old size. When the size cannot be read back, the requested size
-    // stands in for it.
+    // window manager keeps the old size. The size counts as settled when two reads in a row agree
+    // on a size other than the original; failed reads are skipped. At the limit the last good
+    // read stands, or the requested size when no read worked.
     let end = Instant::now() + settle;
+    let mut last = None;
     let fitted = loop {
-        match x.geometry(window) {
-            Ok(size) if size != original || Instant::now() >= end => break size,
-            Ok(_) => thread::sleep(Duration::from_millis(50)),
-            Err(_) => break target,
+        if let Ok(size) = x.geometry(window) {
+            if last == Some(size) && size != original {
+                break size;
+            }
+            last = Some(size);
         }
+        if Instant::now() >= end {
+            break last.unwrap_or(target);
+        }
+        thread::sleep(POLL);
     };
     Ok(Some(Fitted {
         window_id: window.to_string(),
@@ -319,6 +327,41 @@ mod tests {
             (1650, 656),
             "the size read back, not the target"
         );
+    }
+
+    #[test]
+    fn waits_for_the_size_to_settle() {
+        let settle = Duration::from_millis(500);
+        // An interim size, then the final one twice.
+        let mut x = fake(vec![Ok(ORIGINAL), Ok((1800, 900)), Ok(TARGET), Ok(TARGET)]);
+        let fitted = fit(&kitty(), &mut x, (160, 45), (12, 27), settle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fitted.fitted, TARGET, "not the interim size");
+        // A read that fails in between does not end the wait.
+        let mut x = fake(vec![
+            Ok(ORIGINAL),
+            Err("busy".into()),
+            Ok(TARGET),
+            Ok(TARGET),
+        ]);
+        let fitted = fit(&kitty(), &mut x, (160, 45), (12, 27), settle)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fitted.fitted, TARGET);
+        assert_eq!(
+            x.calls.len(),
+            2 + 1 + 3,
+            "state, geometry, resize, three reads"
+        );
+    }
+
+    #[test]
+    fn a_window_already_at_the_target_is_not_resized() {
+        let mut x = fake(vec![Ok(TARGET)]);
+        let fit = fit(&kitty(), &mut x, (134, 23), (12, 27), Duration::ZERO);
+        assert_eq!(fit, Ok(None), "no restore guard either");
+        assert_eq!(x.calls, ["state 42", "geometry 42"]);
     }
 
     #[test]

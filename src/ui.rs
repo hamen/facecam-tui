@@ -377,10 +377,21 @@ mod tests {
             for h in (4..=70).step_by(3) {
                 let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
                 t.draw(|f| draw(f, &app, None, false, CELL)).unwrap();
-                if w < WIDE || h < 12 {
+                let buffer = t.backend().buffer();
+                if w < WIDE {
+                    // Narrow: the panel starts on the row right after the preview's bottom.
+                    let column: String = (0..h).map(|y| buffer[(0, y)].symbol()).collect();
+                    if let Some(bottom) = column.find('└') {
+                        let below = &column[bottom + '└'.len_utf8()..];
+                        if !below.is_empty() && h >= 12 {
+                            assert!(below.starts_with('┌'), "{w}x{h}: panel below: {column}");
+                        }
+                    }
                     continue;
                 }
-                let buffer = t.backend().buffer();
+                if h < 12 {
+                    continue;
+                }
                 let row: String = (0..w).map(|x| buffer[(x, 0)].symbol()).collect();
                 let preview_end = row.find('┐').expect("preview corner");
                 let rest = &row[preview_end + '┐'.len_utf8()..];
@@ -396,6 +407,18 @@ mod tests {
     fn the_help_line_fits_a_wide_terminal() {
         let width = Line::from(help(&App::default())).width();
         assert!(width <= usize::from(WIDE), "{width} > {WIDE}");
+    }
+
+    #[test]
+    fn a_window_problem_shows_in_the_panel() {
+        let mut app = App::default();
+        app.window_problem = Some("could not fit the window: xdotool not found".into());
+        let lines = panel_lines(&app, 50);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string() == "could not fit the window: xdotool not found")
+        );
     }
 
     #[test]
