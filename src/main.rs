@@ -35,7 +35,9 @@ use crate::{
 /// changes every cell and ratatui rewrites them all each frame. With a single id only the first
 /// cell (which carries the transmission) changes, and kitty then shows a large frame's first row
 /// of cells and nothing below it (reproduced with a 1200x675 RGBA frame). It also keeps the frame
-/// on screen intact while the next one is still being transmitted.
+/// on screen intact while the next one is still being transmitted. [`term::draw_synced`] sends the
+/// transmission and the rewritten cells as one synchronized update, so kitty never shows a mix of
+/// the two frames.
 const KITTY_IMAGE_IDS: [u32; 2] = [0x00fa_ce01, 0x00fa_ce02];
 
 fn kitty_image_id(seq: u64) -> u32 {
@@ -153,7 +155,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
             protocol = Some(new_protocol(picker, frame.image, kitty_image_id(frame.seq)));
         }
 
-        terminal.draw(|f| {
+        term::draw_synced(&mut terminal, |f| {
             ui::draw(
                 f,
                 &app,
