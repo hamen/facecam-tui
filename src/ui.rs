@@ -84,13 +84,7 @@ fn draw_preview(
             } else {
                 inner
             };
-            // Scale, not the default Fit: Fit never enlarges, so a large pane showed a small
-            // image. The half-block path keeps Fit behind its cap.
-            let image = if halfblocks {
-                StatefulImage::default()
-            } else {
-                StatefulImage::default().resize(Resize::Scale(None))
-            };
+            let image = StatefulImage::default().resize(preview_resize(halfblocks));
             frame.render_stateful_widget(image, area, protocol);
         }
         (_, state) => {
@@ -102,6 +96,16 @@ fn draw_preview(
             };
             frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
         }
+    }
+}
+
+/// Scale, not the default Fit: Fit never enlarges, so a large pane showed a small image. The
+/// half-block path keeps Fit behind its cap.
+fn preview_resize(halfblocks: bool) -> Resize {
+    if halfblocks {
+        Resize::Fit(None)
+    } else {
+        Resize::Scale(None)
     }
 }
 
@@ -419,6 +423,46 @@ mod tests {
                 .iter()
                 .any(|l| l.to_string() == "could not fit the window: xdotool not found")
         );
+    }
+
+    #[test]
+    fn the_image_scales_to_the_pane_except_for_half_blocks() {
+        assert!(matches!(preview_resize(false), Resize::Scale(None)));
+        assert!(matches!(preview_resize(true), Resize::Fit(None)));
+    }
+
+    /// Draws a small real frame through the kitty protocol: with Scale it fills the hugged pane,
+    /// with Fit it would stay at its own size (96x54 px = 8x2 cells).
+    #[test]
+    fn a_small_frame_fills_the_preview_pane() {
+        use image::{DynamicImage, RgbImage};
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::{
+            FontSize,
+            protocol::{StatefulProtocolType, kitty::StatefulKitty},
+        };
+        let frame = DynamicImage::ImageRgb8(RgbImage::new(96, 54));
+        let kitty = StatefulKitty::new(1, false, false);
+        let mut protocol = StatefulProtocol::new(
+            frame,
+            FontSize::new(CELL.0, CELL.1),
+            None,
+            StatefulProtocolType::Kitty(kitty),
+        );
+        let mut app = App::default();
+        app.preview = Preview::Streaming;
+        let mut t = Terminal::new(TestBackend::new(134, 23)).unwrap();
+        t.draw(|f| draw(f, &app, Some(&mut protocol), false, CELL))
+            .unwrap();
+        // Kitty's placeholder character marks every cell the image covers.
+        let cells = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| c.symbol().contains('\u{10EEEE}'))
+            .count();
+        assert_eq!(cells, 80 * 20, "the whole 80x20 pane");
     }
 
     #[test]
