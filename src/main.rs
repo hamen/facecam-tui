@@ -6,6 +6,7 @@ mod term;
 mod ui;
 mod usb;
 mod v4l2;
+mod window;
 
 use std::{
     io::{self, IsTerminal, Write},
@@ -109,7 +110,26 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
             .spawn(move || control::run(shared, events_tx, sysfs, dev))?;
     }
 
+    let cell = picker.font_size();
     let mut app = App::default();
+    let env = window::Env::from_process(kitty, picker.tmux_detected());
+    // The size is read only for a window to fit: elsewhere its failure is no fit problem.
+    let fitted = match env.window() {
+        None => Ok(None),
+        Some(_) => crossterm::terminal::size()
+            .map_err(|e| format!("could not fit the window: {e}"))
+            .and_then(|grid| {
+                let cell = (cell.width, cell.height);
+                window::fit(&env, &mut window::Xdotool, grid, cell, window::SETTLE)
+            }),
+    };
+    let _restore = match fitted {
+        Ok(fitted) => window::Restore(fitted),
+        Err(problem) => {
+            app.window_problem = Some(problem);
+            window::Restore(None)
+        }
+    };
     let mut capture: Option<(PathBuf, Capture)> = None;
     let mut protocol: Option<StatefulProtocol> = None;
     let mut frames = FrameGate::default();
@@ -161,6 +181,7 @@ fn run(picker: &Picker, kitty: bool) -> Result<()> {
                 &app,
                 protocol.as_mut(),
                 !kitty && picker.protocol_type() == ProtocolType::Halfblocks,
+                (cell.width, cell.height),
             )
         })?;
 

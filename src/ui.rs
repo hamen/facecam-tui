@@ -7,35 +7,52 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
 };
-use ratatui_image::{StatefulImage, protocol::StatefulProtocol};
+use ratatui_image::{Resize, StatefulImage, protocol::StatefulProtocol};
 
 use crate::{
     app::{App, BAR_MAX, FPS60_MAX, Focus, Preview},
     camera::Mode,
+    capture,
 };
 
 /// Wide terminals put the preview on the left.
-const WIDE: u16 = 120;
-const PANEL_WIDTH: u16 = 52;
+pub const WIDE: u16 = 120;
+pub const PANEL_WIDTH: u16 = 52;
 const PANEL_HEIGHT: u16 = 10;
 /// Half-block previews are capped: past this they only cost time.
 const HALFBLOCK_MAX: (u16, u16) = (96, 40);
 
+/// `cell` is the terminal's cell size in pixels (width, height).
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     preview: Option<&mut StatefulProtocol>,
     halfblocks: bool,
+    cell: (u16, u16),
 ) {
     let [main, footer] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+    let image = (capture::WIDTH, capture::HEIGHT);
+    // The preview pane hugs the image; the panel sits right next to it (wide) or below it.
     let (preview_area, panel_area) = if main.width >= WIDE {
-        let [p, c] =
+        let [p, _] =
             Layout::horizontal([Constraint::Min(10), Constraint::Length(PANEL_WIDTH)]).areas(main);
+        let p = outer(preview_inner(inner(p), cell, image)).intersection(main);
+        let c = Rect {
+            x: p.right(),
+            width: PANEL_WIDTH.min(main.right().saturating_sub(p.right())),
+            ..main
+        };
         (p, c)
     } else {
-        let [p, c] =
+        let [p, _] =
             Layout::vertical([Constraint::Min(3), Constraint::Length(PANEL_HEIGHT)]).areas(main);
+        let p = outer(preview_inner(inner(p), cell, image)).intersection(main);
+        let c = Rect {
+            y: p.bottom(),
+            height: PANEL_HEIGHT.min(main.bottom().saturating_sub(p.bottom())),
+            ..main
+        };
         (p, c)
     };
 
@@ -67,7 +84,8 @@ fn draw_preview(
             } else {
                 inner
             };
-            frame.render_stateful_widget(StatefulImage::default(), area, protocol);
+            let image = StatefulImage::default().resize(preview_resize(halfblocks));
+            frame.render_stateful_widget(image, area, protocol);
         }
         (_, state) => {
             let text = match state {
@@ -78,6 +96,54 @@ fn draw_preview(
             };
             frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: true }), inner);
         }
+    }
+}
+
+/// Scale, not the default Fit: Fit never enlarges, so a large pane showed a small image. The
+/// half-block path keeps Fit behind its cap.
+fn preview_resize(halfblocks: bool) -> Resize {
+    if halfblocks {
+        Resize::Fit(None)
+    } else {
+        Resize::Scale(None)
+    }
+}
+
+/// The largest area inside `avail`, anchored top-left, whose size in pixels has the image's
+/// aspect ratio, to the nearest whole cell.
+pub fn preview_inner(avail: Rect, (cw, ch): (u16, u16), (iw, ih): (u32, u32)) -> Rect {
+    if cw == 0 || ch == 0 || iw == 0 || ih == 0 {
+        return avail;
+    }
+    let (cw, ch) = (u64::from(cw), u64::from(ch));
+    let (iw, ih) = (u64::from(iw), u64::from(ih));
+    let (w, h) = (u64::from(avail.width), u64::from(avail.height));
+    // Full height: how many columns keep the aspect?
+    let cols = (h * ch * iw + ih * cw / 2) / (ih * cw);
+    let (cols, rows) = if cols <= w {
+        (cols, h)
+    } else {
+        (w, ((w * cw * ih + iw * ch / 2) / (iw * ch)).min(h))
+    };
+    Rect {
+        width: cols as u16,
+        height: rows as u16,
+        ..avail
+    }
+}
+
+/// The area inside a one-cell border.
+fn inner(area: Rect) -> Rect {
+    Block::default().borders(Borders::ALL).inner(area)
+}
+
+/// The area with a one-cell border around `inner`.
+fn outer(inner: Rect) -> Rect {
+    Rect {
+        x: inner.x.saturating_sub(1),
+        y: inner.y.saturating_sub(1),
+        width: inner.width + 2,
+        height: inner.height + 2,
     }
 }
 
@@ -97,7 +163,18 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let bar_width = inner.width.saturating_sub(24).max(8) as usize;
+    frame.render_widget(
+        Paragraph::new(panel_lines(app, inner.width)).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+/// The panel's text. The control rows and notes fit `width`; the entry and message lines may be
+/// longer (error text of any length) and wrap.
+fn panel_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    // A row is the marker and label (13 columns), the bar, and the value text with its leading
+    // space: 15 columns for the longest, `2500  250.0 ms`.
+    let bar_width = width.saturating_sub(28).max(8) as usize;
 
     let mut lines = Vec::new();
     let exposure_text = match app.exposure {
@@ -125,7 +202,12 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     ));
     let note = app.exposure.and_then(exposure_note).unwrap_or("");
     lines.push(Line::from(Span::styled(
-        format!("          {note}"),
+        format!("  {note}"),
+        Style::default().fg(Color::Yellow),
+    )));
+    let flicker = app.exposure.and_then(flicker_note).unwrap_or("");
+    lines.push(Line::from(Span::styled(
+        format!("  {flicker}"),
         Style::default().fg(Color::Yellow),
     )));
 
@@ -148,6 +230,13 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
     };
     lines.push(row(app, Focus::Mode, "Mode      ", mode, ""));
     lines.push(Line::default());
+    // Before the entry and the message, so a short panel does not push it off the bottom.
+    if let Some(problem) = &app.window_problem {
+        lines.push(Line::from(Span::styled(
+            problem.clone(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
 
     if let Some(entry) = &app.entry {
         lines.push(Line::from(Span::styled(
@@ -160,10 +249,10 @@ fn draw_panel(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::Red),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines
 }
 
-fn row<'a>(app: &App, focus: Focus, label: &'a str, body: &str, value: &str) -> Line<'a> {
+fn row(app: &App, focus: Focus, label: &'static str, body: &str, value: &str) -> Line<'static> {
     let focused = app.focus == focus;
     let marker = if focused { "▶ " } else { "  " };
     let style = if focused {
@@ -187,8 +276,8 @@ fn help(app: &App) -> String {
     if app.entry.is_some() {
         return "digits · Backspace · Enter apply · Esc cancel · Ctrl+C quit".into();
     }
-    "Tab focus · ←/→ ±1 · Shift ±10 · PgUp/PgDn ±100 · [ ] ±flicker-free (Exposure; below 100: up to 100) \
-     · a auto · Enter type · r reload · q quit"
+    "↑↓ select · ←→ step · Shift fine · PgUp/PgDn ±100 · [ ] flicker-free · a auto · Enter type \
+     · r reload · q quit"
         .into()
 }
 
@@ -212,6 +301,11 @@ pub fn bar(value: i64, lo: i64, hi: i64, width: usize, marks: &[i64]) -> String 
             }
         })
         .collect()
+}
+
+/// Under 50 Hz light only multiples of 10 ms (100 units) stay flicker-free.
+pub fn flicker_note(value: u32) -> Option<&'static str> {
+    (!value.is_multiple_of(100)).then_some("flickers under 50 Hz light")
 }
 
 /// The frame-rate warning for an exposure value (units of 100 µs).
@@ -247,6 +341,166 @@ mod tests {
         assert_eq!(b.chars().filter(|c| *c == '┃').count(), 3);
         let covered = bar(333, 1, 333, 30, &[100, 200, 300]);
         assert_eq!(covered.chars().filter(|c| *c == '┃').count(), 0);
+    }
+
+    const CELL: (u16, u16) = (12, 27);
+    const IMAGE: (u32, u32) = (960, 540);
+
+    #[test]
+    fn the_preview_hugs_the_image() {
+        let at = |w, h| Rect::new(3, 4, w, h);
+        // Height-limited: 40 rows of 27 px hold 1080 px, so 1920 px = 160 columns.
+        assert_eq!(preview_inner(at(200, 40), CELL, IMAGE), at(160, 40));
+        // Width-limited: 80 columns of 12 px hold 960 px, so 540 px = 20 rows.
+        assert_eq!(preview_inner(at(80, 40), CELL, IMAGE), at(80, 20));
+        assert_eq!(preview_inner(at(0, 0), CELL, IMAGE), at(0, 0));
+    }
+
+    #[test]
+    fn the_preview_keeps_the_aspect_within_a_cell() {
+        let (cw, ch) = (u64::from(CELL.0), u64::from(CELL.1));
+        let (iw, ih) = (u64::from(IMAGE.0), u64::from(IMAGE.1));
+        for w in 1..=200 {
+            for h in 1..=60 {
+                let avail = Rect::new(0, 0, w, h);
+                let r = preview_inner(avail, CELL, IMAGE);
+                assert!(r.width <= w && r.height <= h, "{avail:?} -> {r:?}");
+                assert!(r.width == w || r.height == h, "uses one full side: {r:?}");
+                let (cols, rows) = (u64::from(r.width), u64::from(r.height));
+                let skew = (cols * cw * ih).abs_diff(rows * ch * iw);
+                assert!(skew <= (ih * cw).max(iw * ch), "{avail:?} -> {r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_panel_sits_next_to_the_preview_at_any_size() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let app = App::default();
+        for w in (10..=220).step_by(7) {
+            for h in (4..=70).step_by(3) {
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| draw(f, &app, None, false, CELL)).unwrap();
+                let buffer = t.backend().buffer();
+                if w < WIDE {
+                    // Narrow: the panel starts on the row right after the preview's bottom.
+                    let column: String = (0..h).map(|y| buffer[(0, y)].symbol()).collect();
+                    if let Some(bottom) = column.find('└') {
+                        let below = &column[bottom + '└'.len_utf8()..];
+                        if !below.is_empty() && h >= 12 {
+                            assert!(below.starts_with('┌'), "{w}x{h}: panel below: {column}");
+                        }
+                    }
+                    continue;
+                }
+                if h < 12 {
+                    continue;
+                }
+                let row: String = (0..w).map(|x| buffer[(x, 0)].symbol()).collect();
+                let preview_end = row.find('┐').expect("preview corner");
+                let rest = &row[preview_end + '┐'.len_utf8()..];
+                assert!(
+                    rest.starts_with('┌'),
+                    "{w}x{h}: panel starts right after: {row}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_help_line_fits_a_wide_terminal() {
+        let width = Line::from(help(&App::default())).width();
+        assert!(width <= usize::from(WIDE), "{width} > {WIDE}");
+    }
+
+    #[test]
+    fn a_window_problem_shows_in_the_panel() {
+        let mut app = App::default();
+        app.window_problem = Some("could not fit the window: xdotool not found".into());
+        let lines = panel_lines(&app, 50);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.to_string() == "could not fit the window: xdotool not found")
+        );
+    }
+
+    #[test]
+    fn the_image_scales_to_the_pane_except_for_half_blocks() {
+        assert!(matches!(preview_resize(false), Resize::Scale(None)));
+        assert!(matches!(preview_resize(true), Resize::Fit(None)));
+    }
+
+    /// Draws a small real frame through the kitty protocol: with Scale it fills the hugged pane,
+    /// with Fit it would stay at its own size (96x54 px = 8x2 cells).
+    #[test]
+    fn a_small_frame_fills_the_preview_pane() {
+        use image::{DynamicImage, RgbImage};
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::{
+            FontSize,
+            protocol::{StatefulProtocolType, kitty::StatefulKitty},
+        };
+        let frame = DynamicImage::ImageRgb8(RgbImage::new(96, 54));
+        let kitty = StatefulKitty::new(1, false, false);
+        let mut protocol = StatefulProtocol::new(
+            frame,
+            FontSize::new(CELL.0, CELL.1),
+            None,
+            StatefulProtocolType::Kitty(kitty),
+        );
+        let mut app = App::default();
+        app.preview = Preview::Streaming;
+        let mut t = Terminal::new(TestBackend::new(134, 23)).unwrap();
+        t.draw(|f| draw(f, &app, Some(&mut protocol), false, CELL))
+            .unwrap();
+        // Kitty's placeholder character marks every cell the image covers.
+        let cells = t
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|c| c.symbol().contains('\u{10EEEE}'))
+            .count();
+        assert_eq!(cells, 80 * 20, "the whole 80x20 pane");
+    }
+
+    #[test]
+    fn flicker_notes() {
+        assert_eq!(flicker_note(100), None);
+        assert_eq!(flicker_note(200), None);
+        assert_eq!(flicker_note(227), Some("flickers under 50 Hz light"));
+        assert_eq!(flicker_note(1), Some("flickers under 50 Hz light"));
+    }
+
+    /// The control rows and notes (everything above the blank line) stay on one row each at the
+    /// default panel width; only the entry and message lines may wrap.
+    #[test]
+    fn panel_rows_fit_the_default_panel() {
+        let width = PANEL_WIDTH - 2;
+        for exposure in [1, 200, 227, 2500] {
+            for brightness in [0, 255] {
+                for focus in [Focus::Exposure, Focus::Brightness, Focus::Mode] {
+                    let mut app = App::default();
+                    app.focus = focus;
+                    app.exposure = Some(exposure);
+                    app.exposure_range = Ok((1, 2500));
+                    app.brightness = Some(brightness);
+                    app.brightness_range = Some((0, 255));
+                    app.mode = Some(Mode::Shutter);
+                    let lines = panel_lines(&app, width);
+                    let fixed: Vec<_> = lines.iter().take_while(|l| l.width() > 0).collect();
+                    assert_eq!(fixed.len(), 5, "exposure, two notes, brightness, mode");
+                    for line in fixed {
+                        assert!(
+                            line.width() <= usize::from(width),
+                            "{exposure}/{brightness}: {} > {width}: {line}",
+                            line.width()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
