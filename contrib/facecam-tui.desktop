@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Facecam
+GenericName=Webcam controls
+Comment=Elgato Facecam exposure, brightness and live preview
+Exec=facecam-tui-launch
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=facecam;webcam;camera;exposure;elgato;
+StartupWMClass=facecam-tui

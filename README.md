@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/header.png" alt="facecam-tui — a terminal UI for the Elgato Facecam on Linux. Exposure locked at 8.3 ms by the driver, now 0.1 to 250 ms, live." width="100%">
+</p>
+
 # facecam-tui
 
 Terminal UI for the Elgato Facecam (USB `0fd9:0078`) on Linux: live preview, a realtime
@@ -20,9 +24,34 @@ half-block characters. The preview needs the camera stream, which only one app c
 Meet (or any other app) uses the camera, the preview pane says so, and the controls still work —
 you see the change in the other app.
 
-Access: `/dev/video*` needs the `video` group. Exposure goes through `/dev/bus/usb/...`, which
-needs a udev rule such as `SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", MODE="0666"` (the Stream
-Deck rules ship one). Without it, exposure is disabled and brightness and mode still work.
+## Setup
+
+`/dev/video*` needs the `video` group. The rest is in one udev file,
+[`contrib/99-facecam.rules`](contrib/99-facecam.rules):
+
+    sudo install -m 644 contrib/99-facecam.rules /etc/udev/rules.d/
+    sudo udevadm control --reload
+
+Then unplug and plug in the camera. The file does three things:
+
+- **Write access to the USB node.** Exposure goes through `/dev/bus/usb/...`. Without access,
+  exposure is disabled, and brightness and mode still work.
+- **USB power saving off.** Linux suspends an idle camera after 2 s. After it wakes up, the
+  Facecam rejects every control request for about half a second, and the app shows
+  `Broken pipe (os error 32)`. Measured: 18 of 18 requests failed with power saving on, 0 of 18
+  with it off.
+- **50 Hz mains.** The camera can start set to 60 Hz, and Auto exposure then flickers under
+  50 Hz lights. Use `power_line_frequency=2` in 60 Hz countries.
+
+## Desktop launcher
+
+To start it from the application menu (or Ulauncher, Rofi, and similar) with no terminal open:
+
+    install -m 755 contrib/facecam-tui-launch ~/.local/bin/
+    install -m 644 contrib/facecam-tui.desktop ~/.local/share/applications/
+
+It opens a kitty window named "Facecam". On `q` the window closes; on an error it stays open so
+you can read the message. Set `FACECAM_TUI` if the binary is not in `~/.cargo/bin`.
 
 ## Keys
 

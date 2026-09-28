@@ -1,0 +1,9 @@
+#!/bin/sh
+# Opens facecam-tui in its own kitty window (kitty is needed for the image preview).
+# The window closes on a normal quit; on an error it stays open so the message can be read.
+# background_opacity=1: a translucent kitty shows the window behind through the empty panel.
+exec kitty --class facecam-tui --title Facecam -o background_opacity=1 sh -c '
+  "${FACECAM_TUI:-$HOME/.cargo/bin/facecam-tui}" && exit 0
+  printf "\nfacecam-tui stopped with an error. Press Enter to close. "
+  read _
+'

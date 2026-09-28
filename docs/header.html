@@ -1,0 +1,58 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{width:1280px;height:640px;overflow:hidden;background:radial-gradient(1200px 700px at 85% 30%,#1b2a4a 0%,#0d1117 55%,#090c10 100%);font-family:'JetBrainsMono NF','Fira Code',monospace;color:#e6edf3;position:relative}
+.grid{position:absolute;inset:0;background-image:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:40px 40px}
+.left{position:absolute;left:84px;top:150px;width:560px}
+h1{font-size:80px;font-weight:800;letter-spacing:-4px;line-height:1;white-space:nowrap}
+h1 span{color:#f0883e}
+.tag{margin-top:26px;font-size:25px;color:#9da7b3;line-height:1.45}
+.stat{margin-top:44px;display:flex;align-items:baseline;gap:18px;font-size:44px;font-weight:700}
+.old{color:#6e7681;text-decoration:line-through;text-decoration-thickness:3px}
+.arrow{color:#6e7681;font-size:36px}
+.new{color:#3fb950}
+.note{margin-top:10px;font-size:18px;color:#6e7681;white-space:nowrap}
+.win{position:absolute;right:72px;top:150px;width:580px;height:290px;border-radius:14px;background:#1e2030;box-shadow:0 40px 80px #0009,inset 0 0 0 1px #ffffff14;overflow:hidden}
+.bar{height:30px;background:#2a2d3e;display:flex;align-items:center;justify-content:center;font-size:13px;color:#9da7b3;position:relative}
+.bar i{position:absolute;top:10px;width:11px;height:11px;border-radius:50%;background:#3b3f52}
+.pane{position:absolute;border:1.5px solid #7a88cf;border-radius:3px}
+.pane b{position:absolute;top:-10px;left:12px;background:#1e2030;padding:0 6px;font-size:13px;font-weight:400;color:#c8d3f5}
+.prev{left:12px;top:44px;width:314px;height:190px}
+.shot{position:absolute;left:6px;top:8px;right:6px;bottom:6px;border-radius:2px;overflow:hidden;background:linear-gradient(180deg,#4a5a78 0%,#34405a 60%,#232b3d 100%)}
+.shot .flag{position:absolute;left:196px;top:22px;width:62px;height:100px;background:#23408e;border-radius:2px}
+.shot .flag::after{content:"";position:absolute;left:14px;top:32px;width:34px;height:34px;border-radius:50%;border:3px solid #d8b24a}
+.shot .shelf{position:absolute;left:18px;top:26px;width:90px;height:62px;border:3px solid #1b2130;border-left:none;border-right:none}
+.shot .head{position:absolute;left:112px;top:36px;width:62px;height:76px;border-radius:48% 48% 44% 44%;background:linear-gradient(160deg,#e3b89a,#b98a6d)}
+.shot .beard{position:absolute;left:118px;top:84px;width:50px;height:36px;border-radius:0 0 26px 26px;background:#6b5a4e}
+.shot .body{position:absolute;left:66px;top:106px;width:156px;height:90px;border-radius:70px 70px 0 0;background:#1d2229}
+.panel{left:338px;top:44px;width:230px;height:190px;font-size:13px;color:#c8d3f5}
+.row{position:absolute;left:10px;right:10px;display:flex;align-items:center;gap:8px;white-space:nowrap}
+.row .k{width:92px}
+.sel{color:#fff;font-weight:700}
+.sl{flex:1;height:10px;position:relative}
+.sl::before{content:"";position:absolute;left:0;right:0;top:4px;height:2px;background:#5fd4c0}
+.fill{position:absolute;left:0;top:0;height:10px;background:#8fe0d0}
+.tick{position:absolute;top:-1px;width:2px;height:12px;background:#5fd4c0}
+.bfill{position:absolute;left:0;top:0;height:10px;background:#82aaff}
+.bline::before{background:#82aaff}
+.v{width:30px;text-align:right}
+.blue{color:#82aaff}
+.help{position:absolute;left:14px;top:252px;right:14px;font-size:12px;color:#6e7681;white-space:nowrap}
+.help em{font-style:normal;color:#9da7b3}
+.cap{position:absolute;right:72px;top:470px;width:580px;white-space:nowrap;text-align:center;font-size:17px;color:#6e7681}
+</style></head><body><div class="grid"></div>
+<div class="left"><h1>facecam<span>-tui</span></h1>
+<div class="tag">A terminal UI for the<br>Elgato Facecam on Linux.</div>
+<div class="stat"><span class="old">8.3 ms</span><span class="arrow">→</span><span class="new">0.1–250 ms</span></div>
+<div class="note">exposure: locked by uvcvideo → yours, live</div></div>
+<div class="win"><div class="bar"><i style="left:12px"></i><i style="left:30px"></i><i style="left:48px"></i>Facecam</div>
+<div class="pane prev"><b>Preview</b><div class="shot"><div class="shelf"></div><div class="flag"></div><div class="body"></div><div class="head"></div><div class="beard"></div></div></div>
+<div class="pane panel"><b>Facecam /dev/video0</b>
+<div class="row sel" style="top:24px"><span class="k">▶ Exposure</span><span class="sl"><span class="fill" style="width:24%"></span><span class="tick" style="left:24%"></span><span class="tick" style="left:52%"></span><span class="tick" style="left:80%"></span></span><span class="v">100</span></div>
+<div class="row" style="top:48px;color:#6e7681;font-size:12px;padding-left:16px">10.0 ms · flicker-free</div>
+<div class="row" style="top:84px"><span class="k">&nbsp; Brightness</span><span class="sl bline"><span class="bfill" style="width:33%"></span></span><span class="v">85</span></div>
+<div class="row" style="top:110px"><span class="k">&nbsp; Mode</span><span class="blue">Shutter Priority</span></div>
+</div>
+<div class="help"><em>↑↓</em> select · <em>←→</em> step · <em>Shift</em> fine · <em>[ ]</em> flicker-free · <em>a</em> auto · <em>q</em> quit</div>
+</div>
+<div class="cap">one binary · kitty graphics · no Camera Hub</div>
+</body></html>
