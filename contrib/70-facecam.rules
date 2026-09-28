@@ -1,0 +1,16 @@
+# Elgato Facecam (0fd9:0078) udev rules for facecam-tui. Install to /etc/udev/rules.d/.
+# The name must sort before 73-seat-late.rules, which turns the uaccess tag into an ACL.
+
+# Exposure goes over usbfs: give the user at the local seat (not every user) write access to
+# the camera's /dev/bus/usb node.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0078", TAG+="uaccess"
+
+# Keep USB power saving off. After an autosuspend (2 s idle) the camera rejects every control
+# request with a stall (EPIPE, "Broken pipe") for about half a second after it wakes up, so any
+# tool that talks to a camera that is not streaming fails.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0078", TEST=="power/control", ATTR{power/control}="on"
+
+# Mains flicker: the camera can come up set to 60 Hz. Under 50 Hz lights (Europe and most of
+# the world outside the Americas) Auto exposure then flickers. Use 2 for 60 Hz countries.
+# Needs v4l2-ctl (package v4l-utils).
+ACTION=="add", SUBSYSTEM=="video4linux", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0078", ATTR{index}=="0", RUN+="/usr/bin/v4l2-ctl -d $devnode -c power_line_frequency=1"
