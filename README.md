@@ -27,15 +27,17 @@ you see the change in the other app.
 ## Setup
 
 `/dev/video*` needs the `video` group. The rest is in one udev file,
-[`contrib/99-facecam.rules`](contrib/99-facecam.rules):
+[`contrib/70-facecam.rules`](contrib/70-facecam.rules), which needs `v4l2-ctl` (package
+`v4l-utils`):
 
-    sudo install -m 644 contrib/99-facecam.rules /etc/udev/rules.d/
+    sudo install -m 644 contrib/70-facecam.rules /etc/udev/rules.d/
     sudo udevadm control --reload
 
 Then unplug and plug in the camera. The file does three things:
 
-- **Write access to the USB node.** Exposure goes through `/dev/bus/usb/...`. Without access,
-  exposure is disabled, and brightness and mode still work.
+- **Write access to the USB node** for the user at the local seat (`uaccess`). Exposure goes
+  through `/dev/bus/usb/...`. Without access, exposure is disabled, and brightness and mode
+  still work.
 - **USB power saving off.** Linux suspends an idle camera after 2 s. After it wakes up, the
   Facecam rejects every control request for about half a second, and the app shows
   `Broken pipe (os error 32)`. Measured: 18 of 18 requests failed with power saving on, 0 of 18
@@ -47,11 +49,13 @@ Then unplug and plug in the camera. The file does three things:
 
 To start it from the application menu (or Ulauncher, Rofi, and similar) with no terminal open:
 
-    install -m 755 contrib/facecam-tui-launch ~/.local/bin/
-    install -m 644 contrib/facecam-tui.desktop ~/.local/share/applications/
+    install -Dm755 contrib/facecam-tui-launch ~/.local/bin/facecam-tui-launch
+    install -Dm644 contrib/facecam-tui.desktop ~/.local/share/applications/facecam-tui.desktop
 
 It opens a kitty window named "Facecam". On `q` the window closes; on an error it stays open so
-you can read the message. Set `FACECAM_TUI` if the binary is not in `~/.cargo/bin`.
+you can read the message. Set `FACECAM_TUI` if the binary is not in `~/.cargo/bin`. The menu
+entry finds the launcher through `PATH`: if `~/.local/bin` is not in your desktop session's
+`PATH`, put the full path in the entry's `Exec=` line.
 
 ## Keys
 
